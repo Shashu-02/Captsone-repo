@@ -1,0 +1,19 @@
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Private cryptographic keys
+backend/keys/
+sender/keys/
+receiver/keys/
+
+# Local runtime data and secrets
+backend/audit_log.sqlite3
+.env
+.env.*
+
+# Local blockchain dependencies
+blockchain/node_modules/
+blockchain/contract_address.txt

@@ -1,46 +1,64 @@
-from Crypto.Cipher import AES
-from Crypto.Util.Padding import pad, unpad
-import ecdsa
-import hashlib
 import os
 
-def encrypt_and_sign(file_data: bytes, aes_key: bytes):
-    """Encrypts data with AES-256 and signs it with SECP256K1."""
-    # 1. Encrypt with AES-CBC
-    iv = os.urandom(16)
-    cipher = AES.new(aes_key, AES.MODE_CBC, iv)
-    encrypted_data = cipher.encrypt(pad(file_data, AES.block_size))
-    
-    encrypted_hex = encrypted_data.hex()
-    iv_hex = iv.hex()
-    
-    # 2. Sign with SECP256K1 Private Key (Assuming saved as private_key.pem)
-    with open("private_key.pem", "rb") as f:
-        sk = ecdsa.SigningKey.from_pem(f.read())
-        
-    signature = sk.sign(encrypted_data, hashfunc=hashlib.sha256)
-    signature_hex = signature.hex()
-    
-    return encrypted_hex, iv_hex, signature_hex
+import ecdsa
+from Crypto.Cipher import AES
+from Crypto.Hash import SHA256
+from Crypto.Protocol.KDF import HKDF
 
 
-def decrypt_and_verify(encrypted_hex: str, iv_hex: str, signature_hex: str, aes_key: bytes):
-    """Verifies the SECP256K1 signature and decrypts the AES-256 data."""
-    encrypted_data = bytes.fromhex(encrypted_hex)
-    iv = bytes.fromhex(iv_hex)
-    signature = bytes.fromhex(signature_hex)
-    
-    # 1. Verify Signature using Public Key
-    with open("public_key.pem", "rb") as f:
-        vk = ecdsa.VerifyingKey.from_pem(f.read())
-        
-    try:
-        vk.verify(signature, encrypted_data, hashfunc=hashlib.sha256)
-    except ecdsa.BadSignatureError:
-        return None # Signature failed
-        
-    # 2. Decrypt with AES-CBC
-    cipher = AES.new(aes_key, AES.MODE_CBC, iv)
-    decrypted_data = unpad(cipher.decrypt(encrypted_data), AES.block_size)
-    
-    return decrypted_data
+def derive_ecdh_shared_key(private_key_path, peer_public_pem):
+    """Derive a 256-bit AES key from local private + peer public key."""
+    with open(private_key_path, "rb") as f:
+        local_private = ecdsa.SigningKey.from_pem(f.read())
+
+    if local_private.curve != ecdsa.SECP256k1:
+        raise ValueError("Unexpected local key curve.")
+
+    if isinstance(peer_public_pem, str):
+        peer_public_pem = peer_public_pem.encode("utf-8")
+
+    peer_public = ecdsa.VerifyingKey.from_pem(peer_public_pem)
+
+    if peer_public.curve != ecdsa.SECP256k1:
+        raise ValueError("Unexpected peer key curve.")
+
+    shared_point = local_private.privkey.secret_multiplier * peer_public.pubkey.point
+    shared_secret = shared_point.x().to_bytes(32, "big")
+
+    return HKDF(
+        master=shared_secret,
+        key_len=32,
+        salt=None,
+        hashmod=SHA256,
+        context=b"secure-off-chain-storage/v1",
+    )
+
+
+def encrypt_gcm(file_data: bytes, aes_key: bytes) -> dict:
+    if len(aes_key) != 32:
+        raise ValueError("AES-256 requires a 32-byte key.")
+
+    nonce = os.urandom(12)
+    cipher = AES.new(aes_key, AES.MODE_GCM, nonce=nonce)
+    ciphertext, tag = cipher.encrypt_and_digest(file_data)
+
+    return {
+        "ciphertext": ciphertext.hex(),
+        "nonce": nonce.hex(),
+        "tag": tag.hex(),
+    }
+
+
+def decrypt_gcm(package: dict, aes_key: bytes) -> bytes:
+    if len(aes_key) != 32:
+        raise ValueError("AES-256 requires a 32-byte key.")
+
+    cipher = AES.new(
+        aes_key,
+        AES.MODE_GCM,
+        nonce=bytes.fromhex(package["nonce"]),
+    )
+    return cipher.decrypt_and_verify(
+        bytes.fromhex(package["ciphertext"]),
+        bytes.fromhex(package["tag"]),
+    )
