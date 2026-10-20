@@ -1,0 +1,49 @@
+{
+  "_format": "hh3-sol-build-info-1",
+  "id": "solc-0_8_34-a59a0e110faac1fe93827ba7a4cc36cdb5ceb62e",
+  "solcVersion": "0.8.34",
+  "solcLongVersion": "0.8.34+commit.80d5c536",
+  "compilerType": "solc",
+  "toolVersions": {
+    "hardhat": "3.20.0"
+  },
+  "userSourceNameMap": {
+    "contracts/DataStorage.sol": "project/contracts/DataStorage.sol"
+  },
+  "input": {
+    "language": "Solidity",
+    "settings": {
+      "evmVersion": "osaka",
+      "optimizer": {
+        "enabled": true,
+        "runs": 200
+      },
+      "outputSelection": {
+        "*": {
+          "": [
+            "ast"
+          ],
+          "*": [
+            "abi",
+            "evm.bytecode.linkReferences",
+            "evm.bytecode.object",
+            "evm.bytecode.opcodes",
+            "evm.bytecode.sourceMap",
+            "evm.deployedBytecode.immutableReferences",
+            "evm.deployedBytecode.linkReferences",
+            "evm.deployedBytecode.object",
+            "evm.deployedBytecode.opcodes",
+            "evm.deployedBytecode.sourceMap",
+            "evm.methodIdentifiers"
+          ]
+        }
+      },
+      "remappings": []
+    },
+    "sources": {
+      "project/contracts/DataStorage.sol": {
+        "content": "// SPDX-License-Identifier: MIT\r\npragma solidity ^0.8.24;\r\n\r\ncontract DataStorage {\r\n    struct Record {\r\n        string cid;\r\n        string dataHash;\r\n        address sender;\r\n        uint256 timestamp;\r\n    }\r\n\r\n    mapping(string => Record) public records;\r\n    event RecordStored(string cid, string dataHash, address sender, uint256 timestamp);\r\n\r\n    function storeRecord(string memory _cid, string memory _dataHash) public {\r\n        records[_cid] = Record({\r\n            cid: _cid,\r\n            dataHash: _dataHash,\r\n            sender: msg.sender,\r\n            timestamp: block.timestamp\r\n        });\r\n        emit RecordStored(_cid, _dataHash, msg.sender, block.timestamp);\r\n    }\r\n}"
+      }
+    }
+  }
+}
