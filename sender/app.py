@@ -15,9 +15,9 @@ from web3 import Web3
 BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
-import audit_manager
 import blockchain_manager
 import ipfs_manager
+import audit_manager
 
 
 # ==========================================
@@ -68,6 +68,7 @@ def get_or_deploy_contract():
         f.write(new_addr)
 
     return new_addr
+
 
 
 MINIMAL_ABI = [
@@ -209,14 +210,10 @@ if "last_filename" not in st.session_state:
     st.session_state.last_filename = "encrypted_package.json"
 if "sender_metrics" not in st.session_state:
     st.session_state.sender_metrics = {
-        "Original file size": None,
-        "Encrypted payload size": None,
-        "IPFS package size": None,
-        "Encryption time (GCM)": None,
-        "SECP256K1 signing time": None,
-        "IPFS upload time": None,
-        "Blockchain confirmation time": None,
-        "Gas used per anchor": None,
+        "Original file size": None, "Encrypted payload size": None,
+        "IPFS package size": None, "Encryption time (GCM)": None,
+        "SECP256K1 signing time": None, "IPFS upload time": None,
+        "Blockchain confirmation time": None, "Gas used per anchor": None,
         "Blockchain transaction cost (ETH)": None,
     }
 
@@ -296,43 +293,40 @@ if st.button("Encrypt for recipient and sign", type="primary"):
         t1 = time.perf_counter()
         signature = signing_key.sign(canonical, hashfunc=hashlib.sha256)
         signing_ms = (time.perf_counter() - t1) * 1000
-        st.session_state.sender_metrics.update(
-            {
-                "Original file size": f"{len(file_bytes):,} bytes",
-                "Encrypted payload size": f"{len(bytes.fromhex(ciphertext)):,} bytes",
-                "Encryption time (GCM)": f"{encryption_ms:.2f} ms",
-                "SECP256K1 signing time": f"{signing_ms:.2f} ms",
-            }
-        )
+        st.session_state.sender_metrics.update({
+            "Original file size": f"{len(file_bytes):,} bytes",
+            "Encrypted payload size": f"{len(bytes.fromhex(ciphertext)):,} bytes",
+            "Encryption time (GCM)": f"{encryption_ms:.2f} ms",
+            "SECP256K1 signing time": f"{signing_ms:.2f} ms",
+        })
         package["signature"] = signature.hex()
         package["sender_signing_public"] = SENDER_SIGN_PUBLIC.read_text()
         st.session_state.payload_to_store = json.dumps(
             package, sort_keys=True, separators=(",", ":")
         )
         st.session_state.last_filename = uploaded_file.name
-        st.session_state.sender_metrics["IPFS package size"] = (
-            f"{len(st.session_state.payload_to_store.encode('utf-8')):,} bytes"
-        )
+        st.session_state.sender_metrics["IPFS package size"] = f"{len(st.session_state.payload_to_store.encode('utf-8')):,} bytes"
         st.session_state.last_cid = st.session_state.last_hash = (
             st.session_state.last_tx
         ) = ""
         st.success("File encrypted with AES-256-GCM and digitally signed.")
-        package_digest = hashlib.sha256(
-            st.session_state.payload_to_store.encode("utf-8")
-        ).hexdigest()
+        package_digest = hashlib.sha256(st.session_state.payload_to_store.encode("utf-8")).hexdigest()
         audit_manager.record_event(
-            event_id=f"sender:encrypt:{package_digest}",
-            event_type="ENCRYPT_AND_SIGN",
-            status="PASS",
-            package_sha256=package_digest,
-            details=f"Encrypted and signed uploaded file name={uploaded_file.name!r}; plaintext is not stored in audit log.",
-        )
+            event_id=f"sender:encrypt:{package_digest}", event_type="ENCRYPT_AND_SIGN",
+            status="PASS", package_sha256=package_digest,
+            details=f"Encrypted and signed uploaded file name={uploaded_file.name!r}; plaintext is not stored in audit log.")
         a, b, c = st.columns(3)
         a.metric("Original size", f"{len(file_bytes):,} bytes")
         b.metric("Ciphertext", f"{len(bytes.fromhex(ciphertext)):,} bytes")
         c.metric("Encrypt / sign", f"{encryption_ms:.2f} / {signing_ms:.2f} ms")
     except Exception as e:
         st.error(f"Encryption failed: {e}")
+
+st.markdown(
+    "**View IPFS node in the official Web UI:** "
+    "[Open IPFS Web UI](http://127.0.0.1:5001/webui)"
+)
+st.caption("This opens your local Kubo IPFS interface in a new browser tab. Start the IPFS daemon first.")
 
 if st.session_state.payload_to_store:
     st.download_button(
@@ -348,30 +342,20 @@ if st.session_state.payload_to_store:
             st.session_state.last_cid = ipfs_manager.upload_data(
                 st.session_state.payload_to_store
             )
-            st.session_state.sender_metrics["IPFS upload time"] = (
-                f"{(time.perf_counter() - ipfs_started) * 1000:.2f} ms"
-            )
+            st.session_state.sender_metrics["IPFS upload time"] = f"{(time.perf_counter() - ipfs_started) * 1000:.2f} ms"
             st.session_state.last_hash = hashlib.sha256(
                 st.session_state.payload_to_store.encode()
             ).hexdigest()
             audit_manager.record_event(
                 event_id=f"sender:ipfs:{st.session_state.last_cid}:{st.session_state.last_hash}",
-                event_type="IPFS_UPLOAD",
-                status="PASS",
-                cid=st.session_state.last_cid,
-                package_sha256=st.session_state.last_hash,
-                details="Encrypted package uploaded to IPFS.",
-            )
+                event_type="IPFS_UPLOAD", status="PASS", cid=st.session_state.last_cid,
+                package_sha256=st.session_state.last_hash, details="Encrypted package uploaded to IPFS.")
             st.success("Encrypted package uploaded to IPFS.")
         except Exception as e:
             audit_manager.record_event(
-                event_id=f"sender:ipfs-error:{hashlib.sha256((str(st.session_state.last_cid) + str(e)).encode()).hexdigest()}",
-                event_type="IPFS_UPLOAD",
-                status="ERROR",
-                cid=st.session_state.last_cid,
-                package_sha256=st.session_state.last_hash,
-                details=str(e),
-            )
+                event_id=f"sender:ipfs-error:{hashlib.sha256((str(st.session_state.last_cid)+str(e)).encode()).hexdigest()}",
+                event_type="IPFS_UPLOAD", status="ERROR", cid=st.session_state.last_cid,
+                package_sha256=st.session_state.last_hash, details=str(e))
             st.error(f"IPFS upload failed: {e}")
 
 if st.session_state.last_cid:
@@ -407,70 +391,38 @@ if st.session_state.last_cid:
             if hasattr(tx, "hex"):
                 tx = tx.hex()
             st.session_state.last_tx = str(tx)
-            st.session_state.sender_metrics["Blockchain confirmation time"] = (
-                f"{(time.perf_counter() - anchor_started) * 1000:.2f} ms"
-            )
+            st.session_state.sender_metrics["Blockchain confirmation time"] = f"{(time.perf_counter() - anchor_started) * 1000:.2f} ms"
             meta = blockchain_manager.get_receipt_metadata(receipt)
             gas_metrics = blockchain_manager.transaction_cost_metrics(receipt)
-            st.session_state.sender_metrics["Gas used per anchor"] = str(
-                gas_metrics.get("gas_used") or "Unavailable"
-            )
-            st.session_state.sender_metrics["Blockchain transaction cost (ETH)"] = (
-                f"{gas_metrics['cost_eth']:.8f} ETH"
-                if gas_metrics.get("cost_eth") is not None
-                else "Unavailable"
-            )
+            st.session_state.sender_metrics["Gas used per anchor"] = str(gas_metrics.get("gas_used") or "Unavailable")
+            st.session_state.sender_metrics["Blockchain transaction cost (ETH)"] = (f"{gas_metrics['cost_eth']:.8f} ETH" if gas_metrics.get("cost_eth") is not None else "Unavailable")
             audit_manager.record_event(
                 event_id=f"sender:anchor:{st.session_state.last_tx or st.session_state.last_cid}",
-                event_type="BLOCKCHAIN_ANCHOR",
-                status="PASS",
-                cid=st.session_state.last_cid,
-                package_sha256=st.session_state.last_hash,
-                block_number=meta.get("block_number"),
+                event_type="BLOCKCHAIN_ANCHOR", status="PASS", cid=st.session_state.last_cid,
+                package_sha256=st.session_state.last_hash, block_number=meta.get("block_number"),
                 blockchain_timestamp_utc=meta.get("blockchain_timestamp_utc", ""),
                 transaction_hash=st.session_state.last_tx,
-                details="CID and package SHA-256 commitment anchored on chain."
-                + (
-                    f" Block metadata note: {meta['metadata_error']}"
-                    if meta.get("metadata_error")
-                    else ""
-                ),
-            )
+                details="CID and package SHA-256 commitment anchored on chain." + (f" Block metadata note: {meta['metadata_error']}" if meta.get("metadata_error") else ""))
             st.success("CID and hash anchored on the local blockchain.")
             g1, g2 = st.columns(2)
-            g1.metric(
-                "Anchor gas used", str(gas_metrics.get("gas_used") or "Unavailable")
-            )
-            g2.metric(
-                "Estimated transaction cost (ETH)",
-                f"{gas_metrics['cost_eth']:.8f}"
-                if gas_metrics.get("cost_eth") is not None
-                else "Unavailable",
-            )
+            g1.metric("Anchor gas used", str(gas_metrics.get("gas_used") or "Unavailable"))
+            g2.metric("Estimated transaction cost (ETH)", f"{gas_metrics['cost_eth']:.8f}" if gas_metrics.get("cost_eth") is not None else "Unavailable")
         except Exception as e:
             audit_manager.record_event(
                 event_id=f"sender:anchor-error:{st.session_state.last_cid}:{st.session_state.last_hash}",
-                event_type="BLOCKCHAIN_ANCHOR",
-                status="ERROR",
-                cid=st.session_state.last_cid,
-                package_sha256=st.session_state.last_hash,
-                details=str(e),
-            )
+                event_type="BLOCKCHAIN_ANCHOR", status="ERROR", cid=st.session_state.last_cid,
+                package_sha256=st.session_state.last_hash, details=str(e))
             st.error(f"Blockchain anchoring failed: {e}")
     if st.session_state.last_tx:
         st.code(st.session_state.last_tx)
 
 st.divider()
 st.header("📊 Sender Performance Metrics")
-st.caption(
-    "Actual measurements from sender operations in this Streamlit session. Unperformed operations remain 'Not measured yet'."
-)
+st.caption("Actual measurements from sender operations in this Streamlit session. Unperformed operations remain 'Not measured yet'.")
 _sender_metric_items = list(st.session_state.sender_metrics.items())
 for _row_start in range(0, len(_sender_metric_items), 3):
     _cols = st.columns(3)
-    for _col, (_label, _value) in zip(
-        _cols, _sender_metric_items[_row_start : _row_start + 3]
-    ):
+    for _col, (_label, _value) in zip(_cols, _sender_metric_items[_row_start:_row_start + 3]):
         _col.metric(_label, _value if _value is not None else "Not measured yet")
 
 st.caption(
