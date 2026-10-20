@@ -562,282 +562,464 @@ audit_manager.render_audit_ui(st, "Receiver")
 
 
 # ==========================================
-# ATTACKER MODE — fail-closed security test suite
+# ATTACKER MODE — MANUAL SECURITY TEST LAB
 # ==========================================
 st.divider()
-st.header("⚠️ Attacker Mode — Security Tests")
+st.header("⚠️ Attacker Mode — Manual Security Testing Lab")
 st.caption(
-    "Tests operate on an uploaded encrypted package and never expose or download plaintext. PASS means the attack was correctly blocked; ERROR means a required service/test could not be evaluated."
+    "Inspect a package you actually uploaded, or select one controlled attack at a time. "
+    "This lab never provides a plaintext download."
+)
+
+scenario = st.selectbox(
+    "Choose a test scenario",
+    [
+        "Scenario A — Diagnose uploaded package",
+        "Scenario B — Manually test a cryptographic attack",
+        "Scenario C — CID, replay and service handling",
+    ],
+    key="manual_attacker_scenario",
 )
 attack_package_upload = st.file_uploader(
-    "Upload encrypted package JSON (original or manually modified)",
+    "Upload encrypted package JSON (original or manually edited)",
     type=["json"],
-    key="attacker_package_json",
+    key="manual_attack_package",
 )
 attack_sender_ecdh_upload = st.file_uploader(
-    "Upload sender ECDH public key (.pem)",
+    "Upload trusted sender ECDH public key (.pem)",
     type=["pem"],
-    key="attacker_sender_ecdh_pem",
+    key="manual_attack_ecdh",
 )
 attack_sender_sign_upload = st.file_uploader(
     "Upload trusted sender signing public key (.pem)",
     type=["pem"],
-    key="attacker_sender_sign_pem",
+    key="manual_attack_sign",
 )
-if st.button("Run attacker test suite", key="run_attacker_suite", type="primary"):
-    import copy
 
-    results = []
 
-    def attack_result(name, blocked, details):
-        results.append(
-            {
-                "Attack test": name,
-                "Result": "PASS" if blocked else "FAIL",
-                "Details": details,
-            }
+def _manual_add(rows, check, status, detector, details):
+    rows.append(
+        {"Check": check, "Result": status, "Detected by": detector, "Details": details}
+    )
+
+
+def _manual_signature_valid(pkg, public_pem):
+    try:
+        if not pkg.get("signature"):
+            return False, "Signature field is missing."
+        vk = ecdsa.VerifyingKey.from_pem(public_pem)
+        vk.verify(
+            bytes.fromhex(pkg["signature"]),
+            canonical_package_fields(pkg),
+            hashfunc=hashlib.sha256,
         )
+        return True, "Signature is valid for the canonical package fields."
+    except Exception as exc:
+        return False, f"Signature verification failed ({type(exc).__name__})."
 
-    def signature_is_valid(pkg, pub_pem):
-        try:
-            if not pkg.get("signature"):
-                return False
-            vk = ecdsa.VerifyingKey.from_pem(pub_pem)
-            vk.verify(
-                bytes.fromhex(pkg["signature"]),
-                canonical_package_fields(pkg),
-                hashfunc=hashlib.sha256,
-            )
-            return True
-        except Exception:
-            return False
 
-    if (
-        attack_package_upload is None
-        or attack_sender_ecdh_upload is None
-        or attack_sender_sign_upload is None
-    ):
-        st.warning(
-            "Upload the encrypted package JSON and both sender public PEM files to run package-based tests."
+def _manual_diagnose(raw_bytes, ecdh_pem, sign_pem):
+    rows = []
+    try:
+        pkg = json.loads(raw_bytes.decode("utf-8"))
+    except Exception as exc:
+        _manual_add(
+            rows,
+            "JSON parsing",
+            "FAIL",
+            "JSON parser",
+            f"Uploaded file is not valid JSON: {exc}",
+        )
+        return rows, None
+
+    required = (
+        "version",
+        "algorithm",
+        "ciphertext",
+        "nonce",
+        "tag",
+        "recipient_ecdh_fingerprint",
+        "sender_ecdh_public",
+        "sender_signing_public",
+        "signature",
+    )
+    missing = [name for name in required if not pkg.get(name)]
+    if missing:
+        _manual_add(
+            rows,
+            "Package schema",
+            "FAIL",
+            "Schema validator",
+            "Missing/empty fields: " + ", ".join(missing),
+        )
+    elif pkg.get("version") != 1 or pkg.get("algorithm") != "AES-256-GCM":
+        _manual_add(
+            rows,
+            "Package schema",
+            "FAIL",
+            "Schema validator",
+            "Unsupported package version or algorithm.",
         )
     else:
+        _manual_add(
+            rows,
+            "Package schema",
+            "PASS",
+            "Schema validator",
+            "Required fields and supported algorithm are present.",
+        )
+
+    try:
+        uploaded_ecdh = ecdsa.VerifyingKey.from_pem(ecdh_pem)
+        packaged_ecdh = ecdsa.VerifyingKey.from_pem(
+            pkg.get("sender_ecdh_public", "").encode()
+        )
+        same_ecdh = (
+            uploaded_ecdh.to_pem() == packaged_ecdh.to_pem()
+            and uploaded_ecdh.curve == ecdsa.SECP256k1
+        )
+        _manual_add(
+            rows,
+            "Sender ECDH public-key binding",
+            "PASS" if same_ecdh else "FAIL",
+            "Public-key binding",
+            "Uploaded key matches package metadata."
+            if same_ecdh
+            else "Uploaded ECDH key differs from package metadata or uses the wrong curve.",
+        )
+    except Exception as exc:
+        _manual_add(
+            rows,
+            "Sender ECDH public-key binding",
+            "FAIL",
+            "PEM parser",
+            f"Cannot validate sender ECDH key: {exc}",
+        )
+
+    packaged_sign = str(pkg.get("sender_signing_public", "")).strip()
+    try:
+        uploaded_sign = ecdsa.VerifyingKey.from_pem(sign_pem).to_pem().decode().strip()
+        package_sign = (
+            ecdsa.VerifyingKey.from_pem(packaged_sign.encode())
+            .to_pem()
+            .decode()
+            .strip()
+        )
+        bound = uploaded_sign == package_sign
+        _manual_add(
+            rows,
+            "Trusted signing-key binding",
+            "PASS" if bound else "FAIL",
+            "Public-key binding",
+            "Uploaded trusted key matches package metadata."
+            if bound
+            else "Uploaded trusted signing key differs from the key embedded in the package.",
+        )
+    except Exception as exc:
+        bound = False
+        _manual_add(
+            rows,
+            "Trusted signing-key binding",
+            "FAIL",
+            "PEM parser",
+            f"Cannot validate signing key: {exc}",
+        )
+
+    sig_ok, sig_detail = _manual_signature_valid(pkg, sign_pem)
+    _manual_add(
+        rows,
+        "Sender digital signature",
+        "PASS" if sig_ok else "FAIL",
+        "SECP256K1 signature verifier",
+        sig_detail,
+    )
+
+    current_fp = (
+        hashlib.sha256(RECIPIENT_ECDH_PUBLIC.read_bytes()).hexdigest()
+        if RECIPIENT_ECDH_PUBLIC.exists()
+        else ""
+    )
+    if not current_fp:
+        _manual_add(
+            rows,
+            "Recipient binding",
+            "ERROR",
+            "Recipient key store",
+            "Generate recipient keys before checking recipient binding.",
+        )
+        recipient_ok = False
+    else:
+        recipient_ok = pkg.get("recipient_ecdh_fingerprint") == current_fp
+        _manual_add(
+            rows,
+            "Recipient binding",
+            "PASS" if recipient_ok else "FAIL",
+            "Recipient fingerprint check",
+            "Package is bound to this recipient key."
+            if recipient_ok
+            else "Fingerprint mismatch: package targets a different recipient key or metadata was changed.",
+        )
+
+    # Only attempt GCM authentication when the signature and recipient binding pass.
+    if sig_ok and recipient_ok and bound:
         try:
-            original = json.loads(attack_package_upload.getvalue().decode("utf-8"))
-            sender_ecdh_pem = attack_sender_ecdh_upload.getvalue()
-            sender_sign_pem = attack_sender_sign_upload.getvalue()
-            # 1. GCM tag mutation: GCM authentication must reject it. This isolated primitive test
-            # deliberately tests the tag independently of signature verification.
-            tag_case = copy.deepcopy(original)
-            tag_hex = str(tag_case.get("tag", ""))
-            if len(tag_hex) >= 2:
-                tag_case["tag"] = ("00" if tag_hex[:2] != "00" else "ff") + tag_hex[2:]
-                gcm_rejected = False
-                try:
-                    if RECIPIENT_ECDH_PRIVATE.exists() and tag_case.get(
-                        "sender_ecdh_public"
-                    ):
-                        test_key = derive_ecdh_shared_key(
-                            RECIPIENT_ECDH_PRIVATE, tag_case["sender_ecdh_public"]
-                        )
-                        decrypt_gcm(
-                            tag_case["ciphertext"],
-                            tag_case["nonce"],
-                            tag_case["tag"],
-                            test_key,
-                        )
-                    else:
-                        raise RuntimeError(
-                            "Recipient private key or sender ECDH metadata unavailable"
-                        )
-                except Exception:
-                    gcm_rejected = True
-                attack_result(
-                    "Modified GCM authentication tag",
-                    gcm_rejected,
-                    "Modified tag was rejected by AES-GCM authentication; no plaintext is returned by this test.",
-                )
-            else:
-                attack_result(
-                    "Modified GCM authentication tag",
-                    False,
-                    "Package tag is missing or malformed.",
-                )
-
-            # 2. Alter signature bytes.
-            sig_case = copy.deepcopy(original)
-            if sig_case.get("signature"):
-                sig_case["signature"] = (
-                    "00" if sig_case["signature"][:2] != "00" else "ff"
-                ) + sig_case["signature"][2:]
-            attack_result(
-                "Altered signature",
-                not signature_is_valid(sig_case, sender_sign_pem),
-                "Altered signature does not verify under the supplied trusted signing key.",
+            if not RECIPIENT_ECDH_PRIVATE.exists():
+                raise FileNotFoundError("Recipient ECDH private key is unavailable.")
+            aes_key = derive_ecdh_shared_key(RECIPIENT_ECDH_PRIVATE, ecdh_pem)
+            decrypt_gcm(pkg["ciphertext"], pkg["nonce"], pkg["tag"], aes_key)
+            _manual_add(
+                rows,
+                "AES-GCM authentication",
+                "PASS",
+                "AES-GCM tag verifier",
+                "Authentication succeeded. Plaintext was immediately discarded; this lab does not offer a download.",
             )
-
-            # 3. Wrong recipient key: recipient fingerprint mismatch must block.
-            wrong_recipient = copy.deepcopy(original)
-            wrong_recipient["recipient_ecdh_fingerprint"] = "00" * 32
-            current_fp = (
-                hashlib.sha256(RECIPIENT_ECDH_PUBLIC.read_bytes()).hexdigest()
-                if RECIPIENT_ECDH_PUBLIC.exists()
-                else ""
+        except Exception as exc:
+            _manual_add(
+                rows,
+                "AES-GCM authentication",
+                "FAIL",
+                "AES-GCM tag verifier",
+                f"Authentication/decryption rejected ({type(exc).__name__}); no plaintext retained.",
             )
-            attack_result(
-                "Wrong recipient key",
-                bool(current_fp)
-                and wrong_recipient.get("recipient_ecdh_fingerprint") != current_fp,
-                "Recipient fingerprint mismatch is detected before decryption.",
-            )
+    else:
+        _manual_add(
+            rows,
+            "AES-GCM authentication",
+            "NOT RUN",
+            "Fail-closed gate",
+            "Signature, key binding, or recipient check failed; decryption was not attempted.",
+        )
+    return rows, pkg
 
-            # 4. Manually modified encrypted data / ciphertext.
-            data_case = copy.deepcopy(original)
-            cipher_hex = str(data_case.get("ciphertext", ""))
-            if len(cipher_hex) >= 2:
-                data_case["ciphertext"] = (
-                    "00" if cipher_hex[:2] != "00" else "ff"
-                ) + cipher_hex[2:]
-            attack_result(
-                "Manually altered encrypted data",
-                bool(cipher_hex) and not signature_is_valid(data_case, sender_sign_pem),
-                "Changing ciphertext invalidates the signed package fields; decryption is not attempted.",
-            )
 
-            # 5. Package without signature.
-            no_sig = copy.deepcopy(original)
-            no_sig.pop("signature", None)
-            attack_result(
-                "Package submitted without signature",
-                not signature_is_valid(no_sig, sender_sign_pem),
-                "Missing signature is rejected.",
+if scenario == "Scenario A — Diagnose uploaded package":
+    st.info(
+        "Upload the original package first, then edit one field in a copy and upload it again. This reports the actual checks that pass or fail for that upload."
+    )
+    if st.button(
+        "Inspect uploaded package", key="manual_inspect_package", type="primary"
+    ):
+        if not all(
+            (
+                attack_package_upload,
+                attack_sender_ecdh_upload,
+                attack_sender_sign_upload,
             )
-
-            # 6. Verify with a different public key.
-            wrong_signer = (
-                ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
-                .get_verifying_key()
-                .to_pem()
+        ):
+            st.warning(
+                "Upload the JSON package and both trusted sender public-key PEM files."
             )
-            attack_result(
-                "Verification with wrong public key",
-                not signature_is_valid(original, wrong_signer),
-                "Signature does not verify under an unrelated signing key.",
+        else:
+            rows, _ = _manual_diagnose(
+                attack_package_upload.getvalue(),
+                attack_sender_ecdh_upload.getvalue(),
+                attack_sender_sign_upload.getvalue(),
             )
-
-            # 7. Replayed record: current protocol uses a unique transfer_id; a previously consumed ID is blocked.
-            # Use a synthetic test ID so the test proves duplicate-consumption handling
-            # without consuming the real package's transfer ID.
-            import uuid
-
-            replay_test_id = "attacker-test-" + uuid.uuid4().hex
-            first_claim = audit_manager.mark_transfer_consumed(
-                replay_test_id, "attacker-test-cid"
-            )
-            second_claim = audit_manager.mark_transfer_consumed(
-                replay_test_id, "attacker-test-cid"
-            )
-            attack_result(
-                "Replayed record / transfer ID",
-                first_claim
-                and not second_claim
-                and audit_manager.transfer_was_consumed(replay_test_id),
-                "The first use is recorded; a second claim for the same transfer ID is rejected. The real uploaded transfer ID was not consumed by this test.",
-            )
-            if not original.get("transfer_id"):
-                results.append(
-                    {
-                        "Attack test": "Legacy package replay compatibility",
-                        "Result": "FAIL",
-                        "Details": "Uploaded package has no transfer_id; create a fresh package with the updated Sender app.",
-                    }
-                )
-
-            # 8. Invalid CID against real blockchain; an unavailable node is ERROR, not a pass.
-            try:
-                invalid_result = blockchain_manager.verify_record_result(
-                    cid="invalid-cid-attacker-test",
-                    contract_address=get_or_deploy_contract(),
-                    abi=MINIMAL_ABI,
-                )
-                if invalid_result.get("status") == "FAIL":
-                    results.append(
-                        {
-                            "Attack test": "Invalid CID",
-                            "Result": "PASS",
-                            "Details": "No matching blockchain record exists for the invalid CID.",
-                        }
-                    )
-                elif invalid_result.get("status") == "ERROR":
-                    results.append(
-                        {
-                            "Attack test": "Invalid CID",
-                            "Result": "ERROR",
-                            "Details": invalid_result.get(
-                                "message",
-                                "Blockchain unavailable; invalid-CID test inconclusive.",
-                            ),
-                        }
-                    )
-                else:
-                    results.append(
-                        {
-                            "Attack test": "Invalid CID",
-                            "Result": "FAIL",
-                            "Details": "Invalid test CID unexpectedly resolved to a record.",
-                        }
-                    )
-            except Exception as exc:
-                results.append(
-                    {
-                        "Attack test": "Invalid CID",
-                        "Result": "ERROR",
-                        "Details": str(exc),
-                    }
-                )
-
-            # 9-10. Service outages: simulate failures through the same fail-closed outcome policy.
-            # These tests do not stop real daemons; they verify that simulated outages cannot authorize plaintext.
-            for name, simulated_exception in [
-                (
-                    "Unavailable IPFS service",
-                    ConnectionError("simulated IPFS unavailable"),
-                ),
-                (
-                    "Unavailable blockchain service",
-                    ConnectionError("simulated blockchain unavailable"),
-                ),
-            ]:
-                try:
-                    raise simulated_exception
-                except Exception as exc:
-                    status = "ERROR"
-                    plaintext_authorized = False
-                    results.append(
-                        {
-                            "Attack test": name,
-                            "Result": "PASS"
-                            if status == "ERROR" and not plaintext_authorized
-                            else "FAIL",
-                            "Details": f"Simulated outage produces {status}; plaintext authorization remains disabled ({exc}).",
-                        }
-                    )
-
-            import pandas as pd
-
-            st.dataframe(
-                pd.DataFrame(results), use_container_width=True, hide_index=True
-            )
-            failed = [r for r in results if r["Result"] != "PASS"]
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+            failed = [r for r in rows if r["Result"] in ("FAIL", "ERROR")]
             if failed:
+                st.error(
+                    "Package diagnosis found an issue. Plaintext download is not available in Attacker Mode."
+                )
+            elif any(r["Result"] == "NOT RUN" for r in rows):
                 st.warning(
-                    f"{len(results) - len(failed)}/{len(results)} attack tests passed. ERROR means the test was inconclusive; FAIL means the attack was not blocked or prerequisites were missing."
+                    "Some checks were not run because an earlier security check failed."
                 )
             else:
                 st.success(
-                    f"All {len(results)} attacker tests passed: each tested attack was blocked or failed closed. No plaintext is exposed by Attacker Mode."
+                    "The tested local package checks passed. This alone does not prove the blockchain commitment matches; use the normal Receiver verification workflow for that."
                 )
-            st.caption(
-                "Outage cases are simulated. Invalid-CID checks use the current local Hardhat service. This suite never offers a plaintext download."
+
+elif scenario == "Scenario B — Manually test a cryptographic attack":
+    st.info(
+        "Choose one attack. The app creates a temporary in-memory modified copy and reports whether the relevant control blocked it. Your uploaded file is not overwritten, and no plaintext is downloaded."
+    )
+    attack_choice = st.selectbox(
+        "Attack to perform",
+        [
+            "Modify GCM authentication tag",
+            "Alter digital signature",
+            "Modify ciphertext",
+            "Remove signature",
+            "Use wrong signing public key",
+            "Use wrong recipient fingerprint",
+        ],
+        key="manual_attack_choice",
+    )
+    if st.button("Run selected attack", key="run_one_manual_attack", type="primary"):
+        if not all(
+            (
+                attack_package_upload,
+                attack_sender_ecdh_upload,
+                attack_sender_sign_upload,
             )
-        except Exception as exc:
-            st.error(f"Attacker test suite could not run: {exc}")
+        ):
+            st.warning(
+                "Upload the JSON package and both trusted sender public-key PEM files first."
+            )
+        else:
+            try:
+                pkg = json.loads(attack_package_upload.getvalue().decode("utf-8"))
+                sign_pem = attack_sender_sign_upload.getvalue()
+                ecdh_pem = attack_sender_ecdh_upload.getvalue()
+                mutated = dict(pkg)
+                if attack_choice == "Modify GCM authentication tag":
+                    tag = str(mutated.get("tag", ""))
+                    if len(tag) < 2:
+                        raise ValueError("Package has no usable GCM tag.")
+                    mutated["tag"] = ("00" if tag[:2] != "00" else "ff") + tag[2:]
+                    key = derive_ecdh_shared_key(RECIPIENT_ECDH_PRIVATE, ecdh_pem)
+                    try:
+                        decrypt_gcm(
+                            mutated["ciphertext"], mutated["nonce"], mutated["tag"], key
+                        )
+                        blocked = False
+                        detector = "AES-GCM authentication"
+                        detail = "Modified tag unexpectedly authenticated."
+                    except Exception as exc:
+                        blocked = True
+                        detector = "AES-GCM authentication"
+                        detail = f"Modified tag rejected ({type(exc).__name__}); no plaintext retained."
+                elif attack_choice == "Alter digital signature":
+                    sig = str(mutated.get("signature", ""))
+                    if not sig:
+                        raise ValueError("Package has no signature to alter.")
+                    mutated["signature"] = ("00" if sig[:2] != "00" else "ff") + sig[2:]
+                    valid, detail = _manual_signature_valid(mutated, sign_pem)
+                    blocked = not valid
+                    detector = "SECP256K1 signature verifier"
+                elif attack_choice == "Modify ciphertext":
+                    ciphertext = str(mutated.get("ciphertext", ""))
+                    if len(ciphertext) < 2:
+                        raise ValueError("Package ciphertext is missing or too short.")
+                    mutated["ciphertext"] = (
+                        "00" if ciphertext[:2] != "00" else "ff"
+                    ) + ciphertext[2:]
+                    valid, detail = _manual_signature_valid(mutated, sign_pem)
+                    blocked = not valid
+                    detector = "Digital signature over canonical fields"
+                elif attack_choice == "Remove signature":
+                    mutated.pop("signature", None)
+                    valid, detail = _manual_signature_valid(mutated, sign_pem)
+                    blocked = not valid
+                    detector = "Required signature / signature verifier"
+                elif attack_choice == "Use wrong signing public key":
+                    wrong_key = (
+                        ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
+                        .get_verifying_key()
+                        .to_pem()
+                    )
+                    valid, detail = _manual_signature_valid(pkg, wrong_key)
+                    blocked = not valid
+                    detector = "Trusted signing public-key verification"
+                else:
+                    mutated["recipient_ecdh_fingerprint"] = "00" * 32
+                    current_fp = (
+                        hashlib.sha256(RECIPIENT_ECDH_PUBLIC.read_bytes()).hexdigest()
+                        if RECIPIENT_ECDH_PUBLIC.exists()
+                        else ""
+                    )
+                    blocked = (
+                        bool(current_fp)
+                        and mutated["recipient_ecdh_fingerprint"] != current_fp
+                    )
+                    detector = "Recipient fingerprint check"
+                    detail = (
+                        "Wrong recipient fingerprint rejected before decryption."
+                        if blocked
+                        else "Recipient identity unavailable or test did not reject the altered fingerprint."
+                    )
+                st.write(f"**Attack:** {attack_choice}")
+                st.write(f"**Detected by:** {detector}")
+                st.write(f"**Details:** {detail}")
+                if blocked:
+                    st.success(
+                        "BLOCKED — the selected attack was rejected as expected. No plaintext download is provided."
+                    )
+                else:
+                    st.error(
+                        "VULNERABLE / INCONCLUSIVE — the selected attack was not rejected as expected. Investigate before claiming protection."
+                    )
+            except Exception as exc:
+                st.error(f"ERROR — could not complete this attack test: {exc}")
+
+else:
+    st.info(
+        "These checks query the local blockchain where applicable. Service outages are not induced automatically; stop a service manually in a controlled test environment to demonstrate a real outage."
+    )
+    cid_to_test = st.text_input("CID to test", key="manual_cid_test")
+    service_test = st.selectbox(
+        "Check",
+        [
+            "Look up this CID on blockchain",
+            "Replay-store duplicate check",
+            "Simulated IPFS unavailable (policy demonstration)",
+            "Simulated blockchain unavailable (policy demonstration)",
+        ],
+        key="manual_service_test",
+    )
+    if st.button("Run selected check", key="manual_run_service_test", type="primary"):
+        if service_test == "Look up this CID on blockchain":
+            if not cid_to_test.strip():
+                st.warning(
+                    "Enter a CID. For a negative test, use a deliberately invalid CID."
+                )
+            else:
+                try:
+                    address = get_or_deploy_contract()
+                    record = blockchain_manager.verify_record_result(
+                        cid=cid_to_test.strip(),
+                        contract_address=address,
+                        abi=MINIMAL_ABI,
+                    )
+                    status = record.get("status", "ERROR")
+                    st.write(f"**Result:** {status}")
+                    st.write(
+                        f"**Details:** {record.get('message', record.get('data', 'No details returned.'))}"
+                    )
+                    if status == "FAIL":
+                        st.success("No record found; retrieval must not proceed.")
+                    elif status == "PASS":
+                        st.warning(
+                            "A record exists. Continue with full package commitment/signature verification before any decryption."
+                        )
+                    else:
+                        st.error(
+                            "Blockchain lookup failed; fail closed and do not decrypt."
+                        )
+                except Exception as exc:
+                    st.error(f"ERROR — blockchain lookup could not complete: {exc}")
+        elif service_test == "Replay-store duplicate check":
+            if not cid_to_test.strip():
+                st.warning(
+                    "Enter a test transfer ID in the CID field (this value is used only as a test ID)."
+                )
+            else:
+                try:
+                    first = audit_manager.mark_transfer_consumed(
+                        cid_to_test.strip(), "manual-attacker-test"
+                    )
+                    second = audit_manager.mark_transfer_consumed(
+                        cid_to_test.strip(), "manual-attacker-test"
+                    )
+                    st.write(f"First claim: {'ACCEPTED' if first else 'REJECTED'}")
+                    st.write(
+                        f"Second claim: {'REJECTED (expected)' if not second else 'ACCEPTED (unexpected)'}"
+                    )
+                    if first and not second:
+                        st.success("Replay protection blocked the duplicate claim.")
+                    else:
+                        st.error(
+                            "Replay check did not behave as expected; inspect the shared replay store."
+                        )
+                except Exception as exc:
+                    st.error(f"ERROR — replay-store check failed: {exc}")
+        else:
+            st.warning(
+                "This is a policy demonstration only; it does not stop or contact the named service. For a real outage test, stop that service in a controlled environment and run normal Receiver verification. Expected outcome: ERROR and no plaintext download."
+            )
+
+st.caption(
+    "Attacker Mode never offers a plaintext download. A successful attack-blocking result is shown as BLOCKED; uploaded package problems are reported as FAIL with the detecting check. Service-outage policy examples are explicitly labeled simulated."
+)
