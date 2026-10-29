@@ -1,0 +1,15 @@
+# Python dependencies for Captsone-repo
+# Install with: python -m pip install -r requirements.txt
+
+streamlit
+ecdsa
+pycryptodome
+cryptography
+web3
+requests
+python-dotenv
+pandas
+numpy
+flask
+nltk
+ipfshttpclient
