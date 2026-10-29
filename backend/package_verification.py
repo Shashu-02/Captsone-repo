@@ -7,7 +7,10 @@ from pathlib import Path
 
 import ecdsa
 
-from trusted_keys import is_trusted
+try:
+    from .trusted_keys import is_trusted
+except ImportError:  # Support legacy execution with backend/ on sys.path.
+    from trusted_keys import is_trusted
 
 
 def canonical_package_fields(package: dict) -> bytes:
@@ -36,6 +39,12 @@ def verify_sender_signature(
     """Return False unless public key is trusted and signature is valid."""
     try:
         public_pem = package["sender_signing_public"]
+        if not isinstance(username, str) or not username.strip():
+            return False
+        if not isinstance(public_pem, (str, bytes)):
+            return False
+        if not isinstance(package.get("signature"), str):
+            return False
         signature = bytes.fromhex(package["signature"])
         if trusted_store is None:
             trusted = is_trusted(username, public_pem)

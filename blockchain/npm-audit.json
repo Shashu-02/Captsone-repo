@@ -1,0 +1,291 @@
+{
+  "auditReportVersion": 2,
+  "vulnerabilities": {
+    "@nomicfoundation/hardhat-ethers": {
+      "name": "@nomicfoundation/hardhat-ethers",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        "@nomicfoundation/hardhat-zod-utils",
+        "hardhat",
+        "zod"
+      ],
+      "effects": [],
+      "range": ">=4.0.0-next.0",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-ethers"
+      ],
+      "fixAvailable": {
+        "name": "@nomicfoundation/hardhat-ethers",
+        "version": "4.0.13",
+        "isSemVerMajor": true
+      }
+    },
+    "@nomicfoundation/hardhat-ethers-chai-matchers": {
+      "name": "@nomicfoundation/hardhat-ethers-chai-matchers",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "hardhat"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-toolbox-mocha-ethers"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-ethers-chai-matchers"
+      ],
+      "fixAvailable": false
+    },
+    "@nomicfoundation/hardhat-ignition": {
+      "name": "@nomicfoundation/hardhat-ignition",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        "@nomicfoundation/hardhat-verify",
+        "hardhat"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-ignition-ethers",
+        "@nomicfoundation/hardhat-toolbox-mocha-ethers"
+      ],
+      "range": ">=3.0.0-next.0",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-ignition"
+      ],
+      "fixAvailable": false
+    },
+    "@nomicfoundation/hardhat-ignition-ethers": {
+      "name": "@nomicfoundation/hardhat-ignition-ethers",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@nomicfoundation/hardhat-ignition",
+        "@nomicfoundation/hardhat-verify",
+        "hardhat"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-toolbox-mocha-ethers"
+      ],
+      "range": ">=3.0.0-next.0",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-ignition-ethers"
+      ],
+      "fixAvailable": false
+    },
+    "@nomicfoundation/hardhat-keystore": {
+      "name": "@nomicfoundation/hardhat-keystore",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@nomicfoundation/hardhat-zod-utils",
+        "hardhat",
+        "zod"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-toolbox-mocha-ethers"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-keystore"
+      ],
+      "fixAvailable": false
+    },
+    "@nomicfoundation/hardhat-mocha": {
+      "name": "@nomicfoundation/hardhat-mocha",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@nomicfoundation/hardhat-zod-utils",
+        "hardhat",
+        "zod"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-toolbox-mocha-ethers"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-mocha"
+      ],
+      "fixAvailable": false
+    },
+    "@nomicfoundation/hardhat-network-helpers": {
+      "name": "@nomicfoundation/hardhat-network-helpers",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "hardhat"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-toolbox-mocha-ethers"
+      ],
+      "range": ">=3.0.0-next.0",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-network-helpers"
+      ],
+      "fixAvailable": false
+    },
+    "@nomicfoundation/hardhat-toolbox-mocha-ethers": {
+      "name": "@nomicfoundation/hardhat-toolbox-mocha-ethers",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        "@nomicfoundation/hardhat-ethers-chai-matchers",
+        "@nomicfoundation/hardhat-ignition",
+        "@nomicfoundation/hardhat-ignition-ethers",
+        "@nomicfoundation/hardhat-keystore",
+        "@nomicfoundation/hardhat-mocha",
+        "@nomicfoundation/hardhat-network-helpers",
+        "@nomicfoundation/hardhat-typechain",
+        "@nomicfoundation/hardhat-verify",
+        "hardhat"
+      ],
+      "effects": [],
+      "range": "*",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-toolbox-mocha-ethers"
+      ],
+      "fixAvailable": false
+    },
+    "@nomicfoundation/hardhat-typechain": {
+      "name": "@nomicfoundation/hardhat-typechain",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@nomicfoundation/hardhat-zod-utils",
+        "hardhat",
+        "zod"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-toolbox-mocha-ethers"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-typechain"
+      ],
+      "fixAvailable": false
+    },
+    "@nomicfoundation/hardhat-verify": {
+      "name": "@nomicfoundation/hardhat-verify",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "@nomicfoundation/hardhat-zod-utils",
+        "hardhat",
+        "zod"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-ignition",
+        "@nomicfoundation/hardhat-ignition-ethers",
+        "@nomicfoundation/hardhat-toolbox-mocha-ethers"
+      ],
+      "range": ">=3.0.0-next.13",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-verify"
+      ],
+      "fixAvailable": false
+    },
+    "@nomicfoundation/hardhat-zod-utils": {
+      "name": "@nomicfoundation/hardhat-zod-utils",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        "zod"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-ethers",
+        "@nomicfoundation/hardhat-keystore",
+        "@nomicfoundation/hardhat-mocha",
+        "@nomicfoundation/hardhat-typechain",
+        "@nomicfoundation/hardhat-verify",
+        "hardhat"
+      ],
+      "range": "*",
+      "nodes": [
+        "node_modules/@nomicfoundation/hardhat-zod-utils"
+      ],
+      "fixAvailable": false
+    },
+    "hardhat": {
+      "name": "hardhat",
+      "severity": "high",
+      "isDirect": true,
+      "via": [
+        "@nomicfoundation/hardhat-zod-utils",
+        "zod"
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-ethers",
+        "@nomicfoundation/hardhat-ethers-chai-matchers",
+        "@nomicfoundation/hardhat-ignition",
+        "@nomicfoundation/hardhat-ignition-ethers",
+        "@nomicfoundation/hardhat-keystore",
+        "@nomicfoundation/hardhat-mocha",
+        "@nomicfoundation/hardhat-network-helpers",
+        "@nomicfoundation/hardhat-toolbox-mocha-ethers",
+        "@nomicfoundation/hardhat-typechain",
+        "@nomicfoundation/hardhat-verify"
+      ],
+      "range": ">=3.0.0-next.0",
+      "nodes": [
+        "node_modules/hardhat"
+      ],
+      "fixAvailable": false
+    },
+    "zod": {
+      "name": "zod",
+      "severity": "high",
+      "isDirect": false,
+      "via": [
+        {
+          "source": 1243066,
+          "name": "zod",
+          "dependency": "zod",
+          "title": "Zod can exhaust memory while validating oversized constrained collections",
+          "url": "https://github.com/advisories/GHSA-mrhx-c7xc-m3w5",
+          "severity": "high",
+          "cwe": [
+            "CWE-770"
+          ],
+          "cvss": {
+            "score": 7.5,
+            "vectorString": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:H"
+          },
+          "range": "<4.6.6"
+        }
+      ],
+      "effects": [
+        "@nomicfoundation/hardhat-ethers",
+        "@nomicfoundation/hardhat-keystore",
+        "@nomicfoundation/hardhat-mocha",
+        "@nomicfoundation/hardhat-typechain",
+        "@nomicfoundation/hardhat-verify",
+        "@nomicfoundation/hardhat-zod-utils",
+        "hardhat"
+      ],
+      "range": "<4.6.6",
+      "nodes": [
+        "node_modules/zod"
+      ],
+      "fixAvailable": false
+    }
+  },
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 0,
+      "moderate": 0,
+      "high": 13,
+      "critical": 0,
+      "total": 13
+    },
+    "dependencies": {
+      "prod": 1,
+      "dev": 221,
+      "optional": 41,
+      "peer": 62,
+      "peerOptional": 0,
+      "total": 221
+    }
+  }
+}

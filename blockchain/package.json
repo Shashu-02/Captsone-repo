@@ -4,7 +4,11 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "test:solidity": "hardhat test solidity",
+    "test:mocha": "hardhat test mocha",
+    "deploy:local": "hardhat ignition deploy ignition/modules/DataStorage.ts"
   },
   "keywords": [],
   "author": "",
@@ -20,7 +24,6 @@
     "@types/node": "^22.20.5",
     "chai": "^6.3.0",
     "ethers": "^6.17.0",
-    "forge-std": "github:foundry-rs/forge-std#v1.16.2",
     "hardhat": "^3.20.0",
     "mocha": "^12.0.3",
     "typescript": "~6.0.3"
