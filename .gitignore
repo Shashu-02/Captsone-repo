@@ -17,3 +17,7 @@ backend/audit_log.sqlite3
 # Local blockchain dependencies
 blockchain/node_modules/
 blockchain/contract_address.txt
+
+# Local user database and secrets
+backend/users.sqlite3
+*.db-journal

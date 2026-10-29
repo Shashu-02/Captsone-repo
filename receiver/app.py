@@ -103,8 +103,12 @@ from pathlib import Path
 from Crypto.Hash import SHA256
 from Crypto.Protocol.KDF import HKDF
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 KEY_DIR = Path(__file__).resolve().parent / "keys"
 KEY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+SENDER_KEY_DIR = PROJECT_ROOT / "sender" / "keys"
+TRUSTED_SENDER_ECDH_PUBLIC = SENDER_KEY_DIR / "sender_ecdh_public.pem"
+TRUSTED_SENDER_SIGN_PUBLIC = SENDER_KEY_DIR / "sender_sign_public.pem"
 SENDER_ECDH_PRIVATE = KEY_DIR / "sender_ecdh_private.pem"
 SENDER_ECDH_PUBLIC = KEY_DIR / "sender_ecdh_public.pem"
 SENDER_SIGN_PRIVATE = KEY_DIR / "sender_sign_private.pem"
@@ -191,6 +195,53 @@ def canonical_package_fields(package):
 st.set_page_config(
     page_title="Secure Storage — Receiver", page_icon="📥", layout="wide"
 )
+
+# --- Authentication and administrator approval gate ---
+from auth_manager import (authenticate, register_user, get_user, ensure_identity, log_event)
+
+if "auth_username" not in st.session_state:
+    st.session_state.auth_username = None
+if not st.session_state.auth_username:
+    st.subheader("Client sign in / registration")
+    mode = st.radio("Choose", ["Sign in", "Register new receiver"], horizontal=True)
+    with st.form("receiver_auth_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Continue")
+    if submitted:
+        try:
+            if mode == "Register new receiver":
+                register_user(username, password, "receiver")
+                st.success("Registration submitted. An administrator must approve your account before access is enabled.")
+            else:
+                user = authenticate(username, password)
+                if not user:
+                    st.error("Invalid username or password.")
+                elif user["role"] != "receiver":
+                    st.error("This account is not a receiver account.")
+                elif user["status"] != "approved":
+                    st.warning(f"Account status: {user['status']}. Please wait for administrator approval.")
+                else:
+                    st.session_state.auth_username = user["username"]
+                    st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    st.stop()
+
+_current_user = get_user(st.session_state.auth_username)
+if not _current_user or _current_user["role"] != "receiver" or _current_user["status"] != "approved":
+    st.session_state.auth_username = None
+    st.error("This account is not approved. Please sign in again after administrator approval.")
+    st.stop()
+if st.button("Sign out", key="auth_signout"):
+    log_event(st.session_state.auth_username, "logout", "receiver portal")
+    st.session_state.auth_username = None
+    st.rerun()
+st.caption(f"Signed in as **{st.session_state.auth_username}** · approved receiver")
+# Auto-provision keys once after approval. Existing keys are never overwritten automatically.
+ensure_identity("recipient", KEY_DIR, generate_identity)
+
+
 st.title("📥 Receiver Portal")
 st.caption("Create recipient identity · Retrieve · Verify · Decrypt")
 if "receiver_metrics" not in st.session_state:
@@ -200,43 +251,11 @@ if "receiver_metrics" not in st.session_state:
         "Decryption time (GCM)": None,
     }
 
-st.warning(
-    "Only the recipient ECDH public key is shareable. The private key stays under receiver/keys/ and is never displayed or exported."
-)
-
-if st.button("Generate / replace recipient keys", type="primary"):
-    try:
-        generate_identity("recipient")
-        st.success("Recipient ECDH and signing key pairs generated.")
-    except Exception as e:
-        st.error(f"Recipient key generation failed: {e}")
-
-if RECIPIENT_ECDH_PUBLIC.exists():
-    st.markdown("**Recipient ECDH public key — give this file to the sender**")
-    st.code(RECIPIENT_ECDH_PUBLIC.read_text())
-    st.download_button(
-        "Download recipient ECDH public key",
-        RECIPIENT_ECDH_PUBLIC.read_bytes(),
-        file_name="recipient_ecdh_public.pem",
-    )
-else:
-    st.info("Generate recipient keys first, then download the public ECDH key.")
+st.info("Cryptographic keys are provisioned automatically after administrator approval and are not replaced on login. In this single-machine demo, trusted public keys are loaded from the local Sender portal automatically.")
 
 st.divider()
 st.header("2. Fetch, verify and decrypt")
 cid = st.text_input("IPFS CID (also used as blockchain lookup key)")
-sender_ecdh_upload = st.file_uploader(
-    "Upload trusted sender ECDH public key (.pem)",
-    type=["pem"],
-    key="trusted_sender_ecdh_pem",
-    help="Upload sender_ecdh_public.pem received from the sender. Do not paste key text here.",
-)
-sender_sign_upload = st.file_uploader(
-    "Upload trusted sender signing public key (.pem)",
-    type=["pem"],
-    key="trusted_sender_signing_pem",
-    help="Upload sender_sign_public.pem received from the sender. Do not paste key text here.",
-)
 if st.button("Fetch, verify and decrypt", type="primary"):
     import uuid
 
@@ -265,28 +284,22 @@ if st.button("Fetch, verify and decrypt", type="primary"):
             fail_check("Input validation", "Enter the CID from the sender.")
         if not RECIPIENT_ECDH_PRIVATE.exists() or not RECIPIENT_ECDH_PUBLIC.exists():
             fail_check("Recipient identity", "Generate recipient keys first.")
-        if sender_ecdh_upload is None or sender_sign_upload is None:
+        if not TRUSTED_SENDER_ECDH_PUBLIC.exists() or not TRUSTED_SENDER_SIGN_PUBLIC.exists():
             fail_check(
                 "Trusted sender keys",
-                "Upload both sender ECDH and sender signing public-key PEM files.",
+                "Sender identity is not available locally. Approve and sign in to a Sender account first.",
             )
         try:
-            sender_ecdh_text = sender_ecdh_upload.getvalue().decode("utf-8").strip()
-            sender_sign_text = sender_sign_upload.getvalue().decode("utf-8").strip()
-        except UnicodeDecodeError:
-            fail_check(
-                "Trusted sender keys",
-                "The uploaded PEM files must be UTF-8 text files.",
-            )
+            sender_ecdh_text = TRUSTED_SENDER_ECDH_PUBLIC.read_text(encoding="utf-8").strip()
+            sender_sign_text = TRUSTED_SENDER_SIGN_PUBLIC.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            fail_check("Trusted sender keys", f"Could not load local Sender public keys: {type(exc).__name__}.")
         if not sender_ecdh_text or not sender_sign_text:
-            fail_check(
-                "Trusted sender keys",
-                "One or both uploaded public-key files are empty.",
-            )
+            fail_check("Trusted sender keys", "One or both local Sender public-key files are empty.")
         add_check(
             "Input and key availability",
             "PASS",
-            "CID, recipient identity, and both uploaded sender public keys are present.",
+            "CID, recipient identity, and locally registered sender public keys are present.",
         )
 
         address = get_or_deploy_contract()
@@ -542,7 +555,7 @@ if st.button("Fetch, verify and decrypt", type="primary"):
         )
 
 st.caption(
-    "Receiver private keys are stored only under receiver/keys/. Upload only the sender's public PEM files and authenticate them through a trusted channel. Public-key text paste fields are disabled."
+    "Receiver private keys are stored only under receiver/keys/. Trusted Sender public keys are loaded automatically from the local Sender portal; no PEM upload or manual key exchange is needed in this single-machine demo."
 )
 
 
@@ -585,16 +598,9 @@ attack_package_upload = st.file_uploader(
     type=["json"],
     key="manual_attack_package",
 )
-attack_sender_ecdh_upload = st.file_uploader(
-    "Upload trusted sender ECDH public key (.pem)",
-    type=["pem"],
-    key="manual_attack_ecdh",
-)
-attack_sender_sign_upload = st.file_uploader(
-    "Upload trusted sender signing public key (.pem)",
-    type=["pem"],
-    key="manual_attack_sign",
-)
+# The test lab also uses locally registered Sender public keys; only the package may be uploaded for tampering tests.
+attack_sender_ecdh_pem = TRUSTED_SENDER_ECDH_PUBLIC.read_bytes() if TRUSTED_SENDER_ECDH_PUBLIC.exists() else None
+attack_sender_sign_pem = TRUSTED_SENDER_SIGN_PUBLIC.read_bytes() if TRUSTED_SENDER_SIGN_PUBLIC.exists() else None
 
 
 def _manual_add(rows, check, status, detector, details):
@@ -803,18 +809,18 @@ if scenario == "Scenario A — Diagnose uploaded package":
         if not all(
             (
                 attack_package_upload,
-                attack_sender_ecdh_upload,
-                attack_sender_sign_upload,
+                attack_sender_ecdh_pem,
+                attack_sender_sign_pem,
             )
         ):
             st.warning(
-                "Upload the JSON package and both trusted sender public-key PEM files."
+                "Upload the JSON package and ensure an approved Sender identity exists."
             )
         else:
             rows, _ = _manual_diagnose(
                 attack_package_upload.getvalue(),
-                attack_sender_ecdh_upload.getvalue(),
-                attack_sender_sign_upload.getvalue(),
+                attack_sender_ecdh_pem,
+                attack_sender_sign_pem,
             )
             st.dataframe(rows, use_container_width=True, hide_index=True)
             failed = [r for r in rows if r["Result"] in ("FAIL", "ERROR")]
@@ -851,18 +857,18 @@ elif scenario == "Scenario B — Manually test a cryptographic attack":
         if not all(
             (
                 attack_package_upload,
-                attack_sender_ecdh_upload,
-                attack_sender_sign_upload,
+                attack_sender_ecdh_pem,
+                attack_sender_sign_pem,
             )
         ):
             st.warning(
-                "Upload the JSON package and both trusted sender public-key PEM files first."
+                "Upload the JSON package and ensure an approved Sender identity exists."
             )
         else:
             try:
                 pkg = json.loads(attack_package_upload.getvalue().decode("utf-8"))
-                sign_pem = attack_sender_sign_upload.getvalue()
-                ecdh_pem = attack_sender_ecdh_upload.getvalue()
+                sign_pem = attack_sender_sign_pem
+                ecdh_pem = attack_sender_ecdh_pem
                 mutated = dict(pkg)
                 if attack_choice == "Modify GCM authentication tag":
                     tag = str(mutated.get("tag", ""))
