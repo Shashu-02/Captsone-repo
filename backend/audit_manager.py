@@ -61,12 +61,17 @@ def _connect():
         """
     )
 
+    # Recipient-scoped replay store: a transfer can be consumed once by each
+    # authorized recipient, but never twice by the same recipient. The legacy
+    # consumed_transfers table is retained for compatibility with existing data.
     con.execute(
         """
-        CREATE TABLE IF NOT EXISTS consumed_transfers (
-            transfer_id TEXT PRIMARY KEY,
+        CREATE TABLE IF NOT EXISTS consumed_transfers_by_recipient (
+            transfer_id TEXT NOT NULL,
+            recipient_fingerprint TEXT NOT NULL,
             cid TEXT NOT NULL DEFAULT '',
-            consumed_at_utc TEXT NOT NULL
+            consumed_at_utc TEXT NOT NULL,
+            PRIMARY KEY (transfer_id, recipient_fingerprint)
         )
         """
     )
@@ -304,46 +309,45 @@ def verify_report(csv_bytes, manifest_bytes):
         }
 
 
-def transfer_was_consumed(transfer_id: str) -> bool:
-    """Return True if this unique transfer ID has already been consumed."""
+def transfer_was_consumed(transfer_id: str, recipient_fingerprint: str = "default") -> bool:
+    """Return whether this transfer was consumed by this recipient identity.
+
+    The default identity preserves the old single-recipient API for existing
+    attacker-mode replay tests and callers.
+    """
     if not transfer_id:
         return False
-
+    recipient_fingerprint = str(recipient_fingerprint or "default")
     con = _connect()
-
     try:
         row = con.execute(
-            "SELECT 1 FROM consumed_transfers WHERE transfer_id = ?",
-            (str(transfer_id),),
+            "SELECT 1 FROM consumed_transfers_by_recipient WHERE transfer_id = ? AND recipient_fingerprint = ?",
+            (str(transfer_id), recipient_fingerprint),
         ).fetchone()
-
         return row is not None
-
     finally:
         con.close()
 
 
-def mark_transfer_consumed(transfer_id: str, cid: str = "") -> bool:
-    """Atomically mark a transfer as consumed once."""
+def mark_transfer_consumed(
+    transfer_id: str, cid: str = "", recipient_fingerprint: str = "default"
+) -> bool:
+    """Atomically consume a transfer once per recipient identity."""
     if not transfer_id:
         raise ValueError("transfer_id is required")
-
+    recipient_fingerprint = str(recipient_fingerprint or "default")
     con = _connect()
-
     try:
         cur = con.execute(
             """
-            INSERT OR IGNORE INTO consumed_transfers (
-                transfer_id, cid, consumed_at_utc
-            )
-            VALUES (?, ?, ?)
+            INSERT OR IGNORE INTO consumed_transfers_by_recipient (
+                transfer_id, recipient_fingerprint, cid, consumed_at_utc
+            ) VALUES (?, ?, ?, ?)
             """,
-            (str(transfer_id), str(cid or ""), utc_now()),
+            (str(transfer_id), recipient_fingerprint, str(cid or ""), utc_now()),
         )
-
         con.commit()
         return cur.rowcount == 1
-
     finally:
         con.close()
 

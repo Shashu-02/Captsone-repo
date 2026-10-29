@@ -176,26 +176,20 @@ def decrypt_gcm(ciphertext_hex, nonce_hex, tag_hex, aes_key):
 
 
 def canonical_package_fields(package):
-    fields = {
-        k: package[k]
-        for k in (
-            "version",
-            "algorithm",
-            "transfer_id",
-            "ciphertext",
-            "nonce",
-            "tag",
-            "recipient_ecdh_fingerprint",
-            "sender_ecdh_public",
-        )
-    }
+    # New multi-recipient packages sign the complete recipient-key envelope.
+    # Keep legacy canonicalization so previously stored v1 packages still verify.
+    if "recipient_keys" in package:
+        names = ("version", "algorithm", "transfer_id", "ciphertext", "nonce", "tag", "recipient_keys", "sender_ecdh_public")
+    else:
+        names = ("version", "algorithm", "transfer_id", "ciphertext", "nonce", "tag", "recipient_ecdh_fingerprint", "sender_ecdh_public")
+    fields = {k: package[k] for k in names}
     return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 st.set_page_config(page_title="Secure Storage — Sender", page_icon="📤", layout="wide")
 
 # --- Authentication and administrator approval gate ---
-from auth_manager import (authenticate, register_user, get_user, ensure_identity, log_event)
+from auth_manager import (authenticate, register_user, get_user, ensure_identity, log_event, list_approved_receiver_public_keys)
 
 if "auth_username" not in st.session_state:
     st.session_state.auth_username = None
@@ -244,9 +238,7 @@ st.title("📤 Sender Portal")
 st.caption(
     "Encrypt for recipient · Sign · Store encrypted package on IPFS · Anchor its hash on Ethereum"
 )
-st.info(
-    "Generate sender keys here. Import only the receiver's public ECDH key; never request or share the receiver's private key."
-)
+st.info("Choose approved recipients from the dropdown. Receiver public keys are discovered automatically; private keys never leave their owner’s device.")
 
 if "payload_to_store" not in st.session_state:
     st.session_state.payload_to_store = None
@@ -276,13 +268,27 @@ else:
 
 st.divider()
 st.header("2. Encrypt and sign a file")
-# Single-machine demo: automatically load the approved Receiver portal's public key.
-recipient_pub = None
-if RECEIVER_ECDH_PUBLIC.exists():
-    recipient_pub = RECEIVER_ECDH_PUBLIC.read_bytes()
-    st.success("Receiver public key detected automatically. No PEM upload required.")
-else:
-    st.warning("Receiver identity is not available yet. Sign in to an approved Receiver account first.")
+# Discover approved recipients automatically from the shared auth database.
+recipient_registry = list_approved_receiver_public_keys()
+recipient_by_label = {
+    f"{row['username']} · {row['fingerprint'][:10]}": row
+    for row in recipient_registry
+}
+if not recipient_by_label:
+    st.warning("No approved Receiver public keys are registered yet. Open each approved Receiver portal once so it can publish its public key.")
+selected_recipient_labels = st.multiselect(
+    "Select recipient(s)",
+    options=list(recipient_by_label.keys()),
+    default=[],
+    help="Choose one receiver for private delivery or multiple receivers for group delivery. Only approved receivers with registered public keys appear here.",
+    key="selected_recipients",
+)
+recipient_public_keys = []
+for label in selected_recipient_labels:
+    row = recipient_by_label[label]
+    recipient_public_keys.append((row["username"], row["ecdh_public_pem"].encode("utf-8")))
+if recipient_public_keys:
+    st.caption(f"Selected {len(recipient_public_keys)} recipient(s): " + ", ".join(label.split(" · ")[0] for label in selected_recipient_labels))
 uploaded_file = st.file_uploader(
     "Choose a file to secure",
     type=["txt", "csv", "json", "pdf", "png", "jpg", "jpeg", "bin"],
@@ -300,17 +306,30 @@ if st.button("Encrypt for recipient and sign", type="primary"):
             ]
         ):
             raise ValueError("Generate sender keys first.")
-        if recipient_pub is None:
-            raise ValueError("Receiver public key is missing. Approve and sign in to the Receiver portal first.")
+        if not recipient_public_keys:
+            raise ValueError("Select at least one approved recipient from the dropdown before encrypting.")
         if uploaded_file is None:
             raise ValueError("Choose a file first.")
-        recipient_vk = ecdsa.VerifyingKey.from_pem(recipient_pub)
-        if recipient_vk.curve != ecdsa.SECP256k1:
-            raise ValueError("Recipient key must use SECP256K1.")
         file_bytes = uploaded_file.getvalue()
         t0 = time.perf_counter()
-        aes_key = derive_ecdh_shared_key(SENDER_ECDH_PRIVATE, recipient_pub)
+        # Encrypt the file once with a fresh random AES-256 key.
+        aes_key = os.urandom(32)
         ciphertext, nonce, tag = encrypt_gcm(file_bytes, aes_key)
+        recipient_envelopes = []
+        for recipient_label, recipient_pub in recipient_public_keys:
+            recipient_vk = ecdsa.VerifyingKey.from_pem(recipient_pub)
+            if recipient_vk.curve != ecdsa.SECP256k1:
+                raise ValueError(f"Recipient '{recipient_label}' key must use SECP256K1.")
+            wrap_key = derive_ecdh_shared_key(SENDER_ECDH_PRIVATE, recipient_pub)
+            wrap_nonce = os.urandom(12)
+            wrap_cipher = AES.new(wrap_key, AES.MODE_GCM, nonce=wrap_nonce)
+            wrapped_aes_key, wrap_tag = wrap_cipher.encrypt_and_digest(aes_key)
+            recipient_envelopes.append({
+                "fingerprint": hashlib.sha256(recipient_vk.to_pem()).hexdigest(),
+                "wrapped_key": wrapped_aes_key.hex(),
+                "wrap_nonce": wrap_nonce.hex(),
+                "wrap_tag": wrap_tag.hex(),
+            })
         encryption_ms = (time.perf_counter() - t0) * 1000
         package = {
             "version": 1,
@@ -319,7 +338,7 @@ if st.button("Encrypt for recipient and sign", type="primary"):
             "ciphertext": ciphertext,
             "nonce": nonce,
             "tag": tag,
-            "recipient_ecdh_fingerprint": hashlib.sha256(recipient_pub).hexdigest(),
+            "recipient_keys": recipient_envelopes,
             "sender_ecdh_public": SENDER_ECDH_PUBLIC.read_text(),
         }
         canonical = canonical_package_fields(package)
@@ -343,7 +362,7 @@ if st.button("Encrypt for recipient and sign", type="primary"):
         st.session_state.last_cid = st.session_state.last_hash = (
             st.session_state.last_tx
         ) = ""
-        st.success("File encrypted with AES-256-GCM and digitally signed.")
+        st.success(f"File encrypted once with AES-256-GCM and signed for {len(recipient_envelopes)} recipient(s).")
         package_digest = hashlib.sha256(st.session_state.payload_to_store.encode("utf-8")).hexdigest()
         audit_manager.record_event(
             event_id=f"sender:encrypt:{package_digest}", event_type="ENCRYPT_AND_SIGN",
