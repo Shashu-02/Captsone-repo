@@ -176,19 +176,13 @@ def decrypt_gcm(ciphertext_hex, nonce_hex, tag_hex, aes_key):
 
 
 def canonical_package_fields(package):
-    fields = {
-        k: package[k]
-        for k in (
-            "version",
-            "algorithm",
-            "transfer_id",
-            "ciphertext",
-            "nonce",
-            "tag",
-            "recipient_ecdh_fingerprint",
-            "sender_ecdh_public",
-        )
-    }
+    # New multi-recipient packages sign the complete recipient-key envelope.
+    # Keep legacy canonicalization so previously stored v1 packages still verify.
+    if "recipient_keys" in package:
+        names = ("version", "algorithm", "transfer_id", "ciphertext", "nonce", "tag", "recipient_keys", "sender_ecdh_public")
+    else:
+        names = ("version", "algorithm", "transfer_id", "ciphertext", "nonce", "tag", "recipient_ecdh_fingerprint", "sender_ecdh_public")
+    fields = {k: package[k] for k in names}
     return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -197,7 +191,7 @@ st.set_page_config(
 )
 
 # --- Authentication and administrator approval gate ---
-from auth_manager import (authenticate, register_user, get_user, ensure_identity, log_event)
+from auth_manager import (authenticate, register_user, get_user, ensure_identity, log_event, publish_receiver_public_key)
 
 if "auth_username" not in st.session_state:
     st.session_state.auth_username = None
@@ -233,6 +227,20 @@ if not _current_user or _current_user["role"] != "receiver" or _current_user["st
     st.session_state.auth_username = None
     st.error("This account is not approved. Please sign in again after administrator approval.")
     st.stop()
+# IMPORTANT SECURITY FIX: each receiver account gets its own local key directory.
+# Previously all accounts on this installation used receiver/keys/recipient_ecdh_private.pem,
+# so logging in as B could use the same cryptographic identity as A.
+_receiver_username = _current_user["username"]
+KEY_DIR = Path(__file__).resolve().parent / "keys" / _receiver_username
+KEY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+try:
+    os.chmod(KEY_DIR, 0o700)
+except OSError:
+    pass
+RECIPIENT_ECDH_PRIVATE = KEY_DIR / "recipient_ecdh_private.pem"
+RECIPIENT_ECDH_PUBLIC = KEY_DIR / "recipient_ecdh_public.pem"
+RECIPIENT_SIGN_PRIVATE = KEY_DIR / "recipient_sign_private.pem"
+RECIPIENT_SIGN_PUBLIC = KEY_DIR / "recipient_sign_public.pem"
 if st.button("Sign out", key="auth_signout"):
     log_event(st.session_state.auth_username, "logout", "receiver portal")
     st.session_state.auth_username = None
@@ -240,6 +248,8 @@ if st.button("Sign out", key="auth_signout"):
 st.caption(f"Signed in as **{st.session_state.auth_username}** · approved receiver")
 # Auto-provision keys once after approval. Existing keys are never overwritten automatically.
 ensure_identity("recipient", KEY_DIR, generate_identity)
+# Publish only the public ECDH key into the shared approved-recipient registry.
+publish_receiver_public_key(st.session_state.auth_username, RECIPIENT_ECDH_PUBLIC.read_bytes())
 
 
 st.title("📥 Receiver Portal")
@@ -369,15 +379,22 @@ if st.button("Fetch, verify and decrypt", type="primary"):
                 "Replay protection",
                 "Package has no unique transfer_id; legacy packages are not accepted by replay protection.",
             )
-        if audit_manager.transfer_was_consumed(package["transfer_id"]):
+        # Replay protection is scoped to this recipient identity. The same
+        # multi-recipient package may be consumed once by A and once by B.
+        recipient_fingerprint = hashlib.sha256(
+            ecdsa.VerifyingKey.from_pem(RECIPIENT_ECDH_PUBLIC.read_bytes()).to_pem()
+        ).hexdigest()
+        if audit_manager.transfer_was_consumed(
+            package["transfer_id"], recipient_fingerprint
+        ):
             fail_check(
                 "Replay protection",
-                "This transfer ID was already successfully consumed; replay rejected.",
+                "This transfer was already successfully consumed by this recipient; replay rejected.",
             )
         add_check(
             "Replay protection",
             "PASS",
-            "Transfer ID is present and has not been consumed before.",
+            "Transfer ID is present and has not been consumed by this recipient before.",
         )
         add_check(
             "Package format",
@@ -401,19 +418,26 @@ if st.button("Fetch, verify and decrypt", type="primary"):
             "Both sender public keys match package metadata.",
         )
 
-        recipient_fingerprint = hashlib.sha256(
-            RECIPIENT_ECDH_PUBLIC.read_bytes()
-        ).hexdigest()
-        if package.get("recipient_ecdh_fingerprint") != recipient_fingerprint:
-            fail_check(
-                "Recipient binding",
-                "Package was encrypted for a different recipient ECDH key.",
+        recipient_envelope = None
+        if "recipient_keys" in package:
+            if not isinstance(package["recipient_keys"], list) or not package["recipient_keys"]:
+                fail_check("Recipient binding", "Recipient envelope list is malformed or empty; refusing legacy fallback.")
+            recipient_envelope = next(
+                (entry for entry in package["recipient_keys"]
+                 if isinstance(entry, dict) and entry.get("fingerprint") == recipient_fingerprint),
+                None,
             )
-        add_check(
-            "Recipient binding",
-            "PASS",
-            "Package is bound to this recipient's ECDH public key.",
-        )
+            if recipient_envelope is None:
+                fail_check("Recipient binding", "This recipient's public-key fingerprint is not authorized for the package.")
+            required_envelope_fields = ("wrapped_key", "wrap_nonce", "wrap_tag")
+            if any(not isinstance(recipient_envelope.get(k), str) or not recipient_envelope.get(k) for k in required_envelope_fields):
+                fail_check("Recipient binding", "Recipient key envelope is incomplete.")
+            add_check("Recipient binding", "PASS", "A recipient-specific wrapped AES key is present for this identity.")
+        else:
+            # Legacy packages are accepted only when explicitly bound to this account's unique key.
+            if package.get("recipient_ecdh_fingerprint") != recipient_fingerprint:
+                fail_check("Recipient binding", "Package was encrypted for a different recipient ECDH key.")
+            add_check("Recipient binding", "PASS", "Legacy package is bound to this recipient's ECDH key.")
 
         canonical = canonical_package_fields(package)
         try:
@@ -436,9 +460,20 @@ if st.button("Fetch, verify and decrypt", type="primary"):
 
         # Derive/decrypt only after all preceding checks have passed.
         try:
-            aes_key = derive_ecdh_shared_key(
+            shared_key = derive_ecdh_shared_key(
                 RECIPIENT_ECDH_PRIVATE, sender_ecdh_text.strip()
             )
+            if recipient_envelope is not None:
+                unwrap_cipher = AES.new(
+                    shared_key, AES.MODE_GCM,
+                    nonce=bytes.fromhex(recipient_envelope["wrap_nonce"]),
+                )
+                aes_key = unwrap_cipher.decrypt_and_verify(
+                    bytes.fromhex(recipient_envelope["wrapped_key"]),
+                    bytes.fromhex(recipient_envelope["wrap_tag"]),
+                )
+            else:
+                aes_key = shared_key
             t1 = time.perf_counter()
             plaintext = decrypt_gcm(
                 package["ciphertext"], package["nonce"], package["tag"], aes_key
@@ -453,12 +488,12 @@ if st.button("Fetch, verify and decrypt", type="primary"):
                 f"Authentication or decryption failed: {exc}",
             )
         if not audit_manager.mark_transfer_consumed(
-            package["transfer_id"], cid.strip()
+            package["transfer_id"], cid.strip(), recipient_fingerprint
         ):
             plaintext = None
             fail_check(
                 "Replay protection",
-                "Another verification consumed this transfer ID first; plaintext download blocked.",
+                "Another verification consumed this transfer for this recipient first; plaintext download blocked.",
             )
         add_check(
             "AES-GCM authentication/decryption",
