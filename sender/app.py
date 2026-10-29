@@ -104,8 +104,11 @@ from pathlib import Path
 from Crypto.Hash import SHA256
 from Crypto.Protocol.KDF import HKDF
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 KEY_DIR = Path(__file__).resolve().parent / "keys"
 KEY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+RECEIVER_KEY_DIR = PROJECT_ROOT / "receiver" / "keys"
+RECEIVER_ECDH_PUBLIC = RECEIVER_KEY_DIR / "recipient_ecdh_public.pem"
 SENDER_ECDH_PRIVATE = KEY_DIR / "sender_ecdh_private.pem"
 SENDER_ECDH_PUBLIC = KEY_DIR / "sender_ecdh_public.pem"
 SENDER_SIGN_PRIVATE = KEY_DIR / "sender_sign_private.pem"
@@ -190,6 +193,53 @@ def canonical_package_fields(package):
 
 
 st.set_page_config(page_title="Secure Storage — Sender", page_icon="📤", layout="wide")
+
+# --- Authentication and administrator approval gate ---
+from auth_manager import (authenticate, register_user, get_user, ensure_identity, log_event)
+
+if "auth_username" not in st.session_state:
+    st.session_state.auth_username = None
+if not st.session_state.auth_username:
+    st.subheader("Client sign in / registration")
+    mode = st.radio("Choose", ["Sign in", "Register new sender"], horizontal=True)
+    with st.form("sender_auth_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Continue")
+    if submitted:
+        try:
+            if mode == "Register new sender":
+                register_user(username, password, "sender")
+                st.success("Registration submitted. An administrator must approve your account before access is enabled.")
+            else:
+                user = authenticate(username, password)
+                if not user:
+                    st.error("Invalid username or password.")
+                elif user["role"] != "sender":
+                    st.error("This account is not a sender account.")
+                elif user["status"] != "approved":
+                    st.warning(f"Account status: {user['status']}. Please wait for administrator approval.")
+                else:
+                    st.session_state.auth_username = user["username"]
+                    st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    st.stop()
+
+_current_user = get_user(st.session_state.auth_username)
+if not _current_user or _current_user["role"] != "sender" or _current_user["status"] != "approved":
+    st.session_state.auth_username = None
+    st.error("This account is not approved. Please sign in again after administrator approval.")
+    st.stop()
+if st.button("Sign out", key="auth_signout"):
+    log_event(st.session_state.auth_username, "logout", "sender portal")
+    st.session_state.auth_username = None
+    st.rerun()
+st.caption(f"Signed in as **{st.session_state.auth_username}** · approved sender")
+# Auto-provision keys once after approval. Existing keys are never overwritten automatically.
+ensure_identity("sender", KEY_DIR, generate_identity)
+
+
 st.title("📤 Sender Portal")
 st.caption(
     "Encrypt for recipient · Sign · Store encrypted package on IPFS · Anchor its hash on Ethereum"
@@ -217,37 +267,22 @@ if "sender_metrics" not in st.session_state:
         "Blockchain transaction cost (ETH)": None,
     }
 
-if st.button("Generate / replace sender keys", type="primary"):
-    try:
-        generate_identity("sender")
-        st.session_state.payload_to_store = None
-        st.session_state.last_cid = st.session_state.last_hash = (
-            st.session_state.last_tx
-        ) = ""
-        st.success("Sender ECDH and signing key pairs generated.")
-    except Exception as e:
-        st.error(f"Sender key generation failed: {e}")
+st.info("Cryptographic keys are provisioned automatically after administrator approval and are not replaced on login.")
 
 if SENDER_ECDH_PUBLIC.exists() and SENDER_SIGN_PUBLIC.exists():
-    c1, c2 = st.columns(2)
-    c1.download_button(
-        "Download sender ECDH public key",
-        SENDER_ECDH_PUBLIC.read_bytes(),
-        file_name="sender_ecdh_public.pem",
-    )
-    c2.download_button(
-        "Download sender signing public key",
-        SENDER_SIGN_PUBLIC.read_bytes(),
-        file_name="sender_sign_public.pem",
-    )
+    st.success("Sender identity is ready. Public keys are registered locally; no key export is required.")
 else:
-    st.warning("Generate sender keys first.")
+    st.warning("Sender identity is not available. Sign in after administrator approval to provision keys.")
 
 st.divider()
 st.header("2. Encrypt and sign a file")
-recipient_upload = st.file_uploader(
-    "Receiver's ECDH public key (.pem)", type=["pem", "txt"], key="recipient_key_upload"
-)
+# Single-machine demo: automatically load the approved Receiver portal's public key.
+recipient_pub = None
+if RECEIVER_ECDH_PUBLIC.exists():
+    recipient_pub = RECEIVER_ECDH_PUBLIC.read_bytes()
+    st.success("Receiver public key detected automatically. No PEM upload required.")
+else:
+    st.warning("Receiver identity is not available yet. Sign in to an approved Receiver account first.")
 uploaded_file = st.file_uploader(
     "Choose a file to secure",
     type=["txt", "csv", "json", "pdf", "png", "jpg", "jpeg", "bin"],
@@ -265,11 +300,10 @@ if st.button("Encrypt for recipient and sign", type="primary"):
             ]
         ):
             raise ValueError("Generate sender keys first.")
-        if recipient_upload is None:
-            raise ValueError("Import the receiver's public ECDH PEM.")
+        if recipient_pub is None:
+            raise ValueError("Receiver public key is missing. Approve and sign in to the Receiver portal first.")
         if uploaded_file is None:
             raise ValueError("Choose a file first.")
-        recipient_pub = recipient_upload.getvalue()
         recipient_vk = ecdsa.VerifyingKey.from_pem(recipient_pub)
         if recipient_vk.curve != ecdsa.SECP256k1:
             raise ValueError("Recipient key must use SECP256K1.")
