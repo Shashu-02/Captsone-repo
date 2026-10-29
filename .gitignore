@@ -21,3 +21,9 @@ blockchain/contract_address.txt
 # Local user database and secrets
 backend/users.sqlite3
 *.db-journal
+
+# Never commit legacy cryptographic secrets
+backend/aes_key.bin
+backend/private_key.pem
+backend/public_key.pem
+**/*_private.pem
