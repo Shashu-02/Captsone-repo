@@ -116,7 +116,7 @@ def log_event(token, action, details=""):
     )
 
 
-def upload_package(token, payload):
+def upload_package(token, payload, recipients):
     """Upload an encrypted package through the central API."""
 
     if isinstance(payload, str):
@@ -130,7 +130,7 @@ def upload_package(token, payload):
         "POST",
         "/api/ipfs/upload",
         token=token,
-        json={"payload_b64": base64.b64encode(payload_bytes).decode("ascii")},
+        json={"payload_b64": base64.b64encode(payload_bytes).decode("ascii"), "recipients": list(recipients)},
     )
 
     return result["cid"]

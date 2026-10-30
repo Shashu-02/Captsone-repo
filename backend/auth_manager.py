@@ -18,6 +18,13 @@ def initialize():
         con.execute("CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY COLLATE NOCASE, password_salt TEXT NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('admin','sender','receiver')), status TEXT NOT NULL CHECK(status IN ('pending','approved','rejected','revoked')), created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, reviewed_by TEXT, reviewed_at TEXT)")
         con.execute("CREATE TABLE IF NOT EXISTS events (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, action TEXT NOT NULL, details TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)")
         con.execute("CREATE TABLE IF NOT EXISTS receiver_public_keys (username TEXT PRIMARY KEY COLLATE NOCASE, ecdh_public_pem TEXT NOT NULL, fingerprint TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE)")
+        con.execute("""CREATE TABLE IF NOT EXISTS ipfs_package_access (
+            cid TEXT NOT NULL,
+            sender_username TEXT NOT NULL,
+            recipient_username TEXT NOT NULL COLLATE NOCASE,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (cid, recipient_username)
+        )""")
 
 def _hash(password, salt):
     return hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), ITERATIONS).hex()
@@ -130,3 +137,39 @@ def list_approved_receiver_public_keys():
     with _connect() as con:
         rows = con.execute("SELECT u.username, r.ecdh_public_pem, r.fingerprint FROM users u JOIN receiver_public_keys r ON r.username=u.username WHERE u.role='receiver' AND u.status='approved' ORDER BY u.username COLLATE NOCASE").fetchall()
         return [dict(r) for r in rows]
+
+
+def register_package_access(cid, sender_username, recipient_usernames):
+    """Persist the receiver allow-list for a newly uploaded encrypted package."""
+    initialize()
+    if not cid or not sender_username or not recipient_usernames:
+        raise ValueError("CID, sender, and at least one recipient are required.")
+    names = sorted({str(name).strip() for name in recipient_usernames if str(name).strip()}, key=str.casefold)
+    if not names:
+        raise ValueError("At least one recipient is required.")
+    with _connect() as con:
+        sender = con.execute("SELECT role,status FROM users WHERE username=?", (sender_username,)).fetchone()
+        if not sender or sender["role"] != "sender" or sender["status"] != "approved":
+            raise ValueError("Sender account is not approved.")
+        for name in names:
+            receiver = con.execute("SELECT role,status FROM users WHERE username=?", (name,)).fetchone()
+            if not receiver or receiver["role"] != "receiver" or receiver["status"] != "approved":
+                raise ValueError(f"Recipient {name!r} is not an approved receiver.")
+        con.executemany(
+            "INSERT INTO ipfs_package_access(cid,sender_username,recipient_username) VALUES(?,?,?)",
+            [(cid, sender_username, name) for name in names],
+        )
+        _event(con, sender_username, "package_access_registered", f"cid={cid}; recipients={','.join(names)}")
+
+
+def can_access_package(cid, recipient_username):
+    """Fail closed: only a receiver explicitly listed for this CID can retrieve it."""
+    initialize()
+    with _connect() as con:
+        row = con.execute(
+            """SELECT 1 FROM ipfs_package_access a
+               JOIN users u ON u.username=a.recipient_username
+               WHERE a.cid=? AND a.recipient_username=? AND u.role='receiver' AND u.status='approved'""",
+            (cid, recipient_username),
+        ).fetchone()
+        return row is not None

@@ -234,6 +234,7 @@ def admin_events(
 
 class IPFSUploadRequest(BaseModel):
     payload_b64: str = Field(min_length=1)
+    recipients: list[str] = Field(min_length=1, max_length=100)
 
 
 @app.post("/api/ipfs/upload")
@@ -241,28 +242,24 @@ def upload_to_ipfs(
     data: IPFSUploadRequest,
     user: dict[str, Any] = Depends(_current_user),
 ) -> dict[str, str]:
-
     if user["role"] != "sender":
-        raise HTTPException(
-            status_code=403,
-            detail="Only approved senders can upload packages.",
-        )
-
+        raise HTTPException(status_code=403, detail="Only approved senders can upload packages.")
+    max_bytes = int(os.environ.get("CAPSTONE_MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
     try:
         payload = base64.b64decode(data.payload_b64, validate=True)
-
         if not payload:
             raise ValueError("Empty package.")
-
+        if len(payload) > max_bytes:
+            raise HTTPException(status_code=413, detail=f"Package exceeds {max_bytes} byte upload limit.")
         cid = ipfs_manager.upload_data(payload.decode("utf-8"))
-
+        auth_manager.register_package_access(cid, user["username"], data.recipients)
         return {"cid": cid, "status": "PASS"}
-
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"IPFS upload failed: {exc}",
-        )
+        raise HTTPException(status_code=502, detail=f"IPFS upload failed: {exc}")
 
 
 @app.get("/api/ipfs/{cid}")
@@ -270,26 +267,15 @@ def retrieve_from_ipfs(
     cid: str,
     user: dict[str, Any] = Depends(_current_user),
 ) -> dict[str, str]:
-
     if user["role"] != "receiver":
-        raise HTTPException(
-            status_code=403,
-            detail="Only approved receivers can retrieve packages.",
-        )
-
+        raise HTTPException(status_code=403, detail="Only approved receivers can retrieve packages.")
+    if not auth_manager.can_access_package(cid, user["username"]):
+        raise HTTPException(status_code=404, detail="Package not found or this receiver is not authorized.")
     try:
         content = ipfs_manager.retrieve_file_bytes(cid)
-
-        return {
-            "status": "PASS",
-            "content_b64": base64.b64encode(content).decode("ascii"),
-        }
-
+        return {"status": "PASS", "content_b64": base64.b64encode(content).decode("ascii")}
     except Exception as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"IPFS retrieval failed: {exc}",
-        )
+        raise HTTPException(status_code=502, detail=f"IPFS retrieval failed: {exc}")
 
 
 # ==========================================

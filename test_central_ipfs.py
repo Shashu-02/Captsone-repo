@@ -37,7 +37,7 @@ def main():
     upload_response = requests.post(
         f"{API}/api/ipfs/upload",
         headers={"Authorization": f"Bearer {sender_token}"},
-        json={"payload_b64": base64.b64encode(original).decode("ascii")},
+        json={"payload_b64": base64.b64encode(original).decode("ascii"), "recipients": ["Rec"]},
         timeout=30,
     )
     upload_response.raise_for_status()

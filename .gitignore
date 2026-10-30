@@ -27,3 +27,23 @@ backend/aes_key.bin
 backend/private_key.pem
 backend/public_key.pem
 **/*_private.pem
+
+# Local runtime and secrets
+.runtime/
+.env
+.env.*
+*.sqlite3
+*.db
+*.pem
+*.key
+backend/aes_key.bin
+backend/keys/
+sender/keys/
+receiver/keys/
+*.backup
+backup/
+api-integration-patched-files/
+blockchain/contract_address.txt
+backend/contract_address.txt
+blockchain/ignition/deployments/
+blockchain/node_modules/

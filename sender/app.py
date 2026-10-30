@@ -398,6 +398,7 @@ if st.session_state.payload_to_store:
             st.session_state.last_cid = api_client.upload_package(
                 st.session_state.api_token,
                 st.session_state.payload_to_store,
+                [username for username, _public_key in recipient_public_keys],
             )
             st.session_state.sender_metrics["IPFS upload time"] = (
                 f"{(time.perf_counter() - ipfs_started) * 1000:.2f} ms"
