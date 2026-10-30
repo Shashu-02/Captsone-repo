@@ -1,4 +1,3 @@
-import glob
 import hashlib
 import json
 import os
@@ -10,91 +9,12 @@ from pathlib import Path
 import ecdsa
 import streamlit as st
 from Crypto.Cipher import AES
-from web3 import Web3
 
 BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
-import blockchain_manager
-import ipfs_manager
 import audit_manager
 
-
-# ==========================================
-# AUTOMATIC SMART CONTRACT DEPLOYER
-# ==========================================
-def get_or_deploy_contract():
-    w3 = Web3(Web3.HTTPProvider("http://127.0.0.1:8545"))
-    if not w3.is_connected():
-        raise RuntimeError(
-            "Hardhat RPC is unavailable at http://127.0.0.1:8545. Start npx hardhat node first."
-        )
-
-    addr_file = str(
-        Path(__file__).resolve().parents[1] / "blockchain" / "contract_address.txt"
-    )
-    if os.path.exists(addr_file):
-        with open(addr_file, "r") as f:
-            saved_addr = f.read().strip()
-        try:
-            if w3.eth.get_code(Web3.to_checksum_address(saved_addr)) not in (
-                b"",
-                b"\x00",
-            ):
-                return saved_addr
-        except Exception:
-            pass
-
-    artifacts_root = Path(__file__).resolve().parents[1] / "blockchain"
-    files = glob.glob(
-        str(artifacts_root / "artifacts/contracts/**/DataStorage.json"), recursive=True
-    )
-    files = [f for f in files if not f.endswith(".dbg.json")]
-    if not files:
-        raise FileNotFoundError(
-            "Compiled contract artifact not found. Install Hardhat and run npx hardhat compile in the blockchain folder."
-        )
-
-    with open(files[0], "r") as f:
-        data = json.load(f)
-
-    w3.eth.default_account = w3.eth.accounts[0]
-    Contract = w3.eth.contract(abi=data["abi"], bytecode=data["bytecode"])
-    tx_hash = Contract.constructor().transact()
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-
-    new_addr = receipt.contractAddress
-    with open(addr_file, "w") as f:
-        f.write(new_addr)
-
-    return new_addr
-
-
-
-MINIMAL_ABI = [
-    {
-        "inputs": [
-            {"internalType": "string", "name": "_cid", "type": "string"},
-            {"internalType": "string", "name": "_dataHash", "type": "string"},
-        ],
-        "name": "storeRecord",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    {
-        "inputs": [{"internalType": "string", "name": "", "type": "string"}],
-        "name": "records",
-        "outputs": [
-            {"internalType": "string", "name": "cid", "type": "string"},
-            {"internalType": "string", "name": "dataHash", "type": "string"},
-            {"internalType": "address", "name": "sender", "type": "address"},
-            {"internalType": "uint256", "name": "timestamp", "type": "uint256"},
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    },
-]
 
 # ==========================================
 # CRYPTOGRAPHIC HELPERS: ECDH + HKDF + AES-GCM
@@ -176,25 +96,53 @@ def decrypt_gcm(ciphertext_hex, nonce_hex, tag_hex, aes_key):
 
 
 def canonical_package_fields(package):
-    # New multi-recipient packages sign the complete recipient-key envelope.
-    # Keep legacy canonicalization so previously stored v1 packages still verify.
+    """Return deterministic bytes for every security-relevant package field."""
     if "recipient_keys" in package:
-        names = ("version", "algorithm", "transfer_id", "ciphertext", "nonce", "tag", "recipient_keys", "sender_ecdh_public")
+        names = (
+            "version",
+            "algorithm",
+            "transfer_id",
+            "sender_username",
+            "ciphertext",
+            "nonce",
+            "tag",
+            "recipient_keys",
+            "sender_ecdh_public",
+        )
     else:
-        names = ("version", "algorithm", "transfer_id", "ciphertext", "nonce", "tag", "recipient_ecdh_fingerprint", "sender_ecdh_public")
-    fields = {k: package[k] for k in names}
+        # Legacy package shape retained for parsing older records. New receiver
+        # verification still requires sender_username and trusted-key approval.
+        names = (
+            "version",
+            "algorithm",
+            "transfer_id",
+            "sender_username",
+            "ciphertext",
+            "nonce",
+            "tag",
+            "recipient_ecdh_fingerprint",
+            "sender_ecdh_public",
+        )
+    missing = [name for name in names if name not in package]
+    if missing:
+        raise ValueError(f"Package is missing signed fields: {', '.join(missing)}")
+    fields = {name: package[name] for name in names}
     return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
 st.set_page_config(page_title="Secure Storage — Sender", page_icon="📤", layout="wide")
 
-# --- Authentication and administrator approval gate ---
-from auth_manager import (authenticate, register_user, get_user, ensure_identity, log_event, list_approved_receiver_public_keys)
+# --- Central API authentication and administrator approval gate ---
+import api_client
+from auth_manager import ensure_identity
 
 if "auth_username" not in st.session_state:
     st.session_state.auth_username = None
-if not st.session_state.auth_username:
-    st.subheader("Client sign in / registration")
+if "api_token" not in st.session_state:
+    st.session_state.api_token = None
+
+if not st.session_state.api_token:
+    st.subheader("Central account sign in / registration")
     mode = st.radio("Choose", ["Sign in", "Register new sender"], horizontal=True)
     with st.form("sender_auth_form"):
         username = st.text_input("Username")
@@ -203,34 +151,47 @@ if not st.session_state.auth_username:
     if submitted:
         try:
             if mode == "Register new sender":
-                register_user(username, password, "sender")
-                st.success("Registration submitted. An administrator must approve your account before access is enabled.")
+                result = api_client.register(username, password, "sender")
+                st.success(
+                    result.get("message", "Registration submitted for admin approval.")
+                )
             else:
-                user = authenticate(username, password)
-                if not user:
-                    st.error("Invalid username or password.")
-                elif user["role"] != "sender":
+                result = api_client.login(username, password)
+                user = result["user"]
+                if user["role"] != "sender":
                     st.error("This account is not a sender account.")
-                elif user["status"] != "approved":
-                    st.warning(f"Account status: {user['status']}. Please wait for administrator approval.")
                 else:
+                    st.session_state.api_token = result["access_token"]
                     st.session_state.auth_username = user["username"]
                     st.rerun()
         except Exception as exc:
             st.error(str(exc))
     st.stop()
 
-_current_user = get_user(st.session_state.auth_username)
-if not _current_user or _current_user["role"] != "sender" or _current_user["status"] != "approved":
+try:
+    _current_user = api_client.me(st.session_state.api_token)
+except Exception as exc:
+    st.session_state.api_token = None
     st.session_state.auth_username = None
-    st.error("This account is not approved. Please sign in again after administrator approval.")
+    st.error(f"Central API session expired or unavailable: {exc}")
     st.stop()
+
+if _current_user["role"] != "sender":
+    st.session_state.api_token = None
+    st.session_state.auth_username = None
+    st.error("This account is not a sender account.")
+    st.stop()
+
 if st.button("Sign out", key="auth_signout"):
-    log_event(st.session_state.auth_username, "logout", "sender portal")
+    try:
+        api_client.log_event(st.session_state.api_token, "logout", "sender portal")
+    except Exception:
+        pass
+    st.session_state.api_token = None
     st.session_state.auth_username = None
     st.rerun()
 st.caption(f"Signed in as **{st.session_state.auth_username}** · approved sender")
-# Auto-provision keys once after approval. Existing keys are never overwritten automatically.
+# Private signing and ECDH keys remain on this sender device.
 ensure_identity("sender", KEY_DIR, generate_identity)
 
 
@@ -238,7 +199,9 @@ st.title("📤 Sender Portal")
 st.caption(
     "Encrypt for recipient · Sign · Store encrypted package on IPFS · Anchor its hash on Ethereum"
 )
-st.info("Choose approved recipients from the dropdown. Receiver public keys are discovered automatically; private keys never leave their owner’s device.")
+st.info(
+    "Choose approved recipients from the dropdown. Receiver public keys are discovered automatically; private keys never leave their owner’s device."
+)
 
 if "payload_to_store" not in st.session_state:
     st.session_state.payload_to_store = None
@@ -252,30 +215,45 @@ if "last_filename" not in st.session_state:
     st.session_state.last_filename = "encrypted_package.json"
 if "sender_metrics" not in st.session_state:
     st.session_state.sender_metrics = {
-        "Original file size": None, "Encrypted payload size": None,
-        "IPFS package size": None, "Encryption time (GCM)": None,
-        "SECP256K1 signing time": None, "IPFS upload time": None,
-        "Blockchain confirmation time": None, "Gas used per anchor": None,
+        "Original file size": None,
+        "Encrypted payload size": None,
+        "IPFS package size": None,
+        "Encryption time (GCM)": None,
+        "SECP256K1 signing time": None,
+        "IPFS upload time": None,
+        "Blockchain confirmation time": None,
+        "Gas used per anchor": None,
         "Blockchain transaction cost (ETH)": None,
     }
 
-st.info("Cryptographic keys are provisioned automatically after administrator approval and are not replaced on login.")
+st.info(
+    "Cryptographic keys are provisioned automatically after administrator approval and are not replaced on login."
+)
 
 if SENDER_ECDH_PUBLIC.exists() and SENDER_SIGN_PUBLIC.exists():
-    st.success("Sender identity is ready. Public keys are registered locally; no key export is required.")
+    st.success(
+        "Sender identity is ready. Public keys are registered locally; no key export is required."
+    )
 else:
-    st.warning("Sender identity is not available. Sign in after administrator approval to provision keys.")
+    st.warning(
+        "Sender identity is not available. Sign in after administrator approval to provision keys."
+    )
 
 st.divider()
 st.header("2. Encrypt and sign a file")
-# Discover approved recipients automatically from the shared auth database.
-recipient_registry = list_approved_receiver_public_keys()
+# Discover approved recipients through the central API.
+try:
+    recipient_registry = api_client.list_receivers(st.session_state.api_token)
+except Exception as exc:
+    recipient_registry = []
+    st.error(f"Could not load approved receivers from central API: {exc}")
 recipient_by_label = {
-    f"{row['username']} · {row['fingerprint'][:10]}": row
-    for row in recipient_registry
+    f"{row['username']} · {row['fingerprint'][:10]}": row for row in recipient_registry
 }
 if not recipient_by_label:
-    st.warning("No approved Receiver public keys are registered yet. Open each approved Receiver portal once so it can publish its public key.")
+    st.warning(
+        "No approved Receiver public keys are registered yet. Open each approved Receiver portal once so it can publish its public key."
+    )
 selected_recipient_labels = st.multiselect(
     "Select recipient(s)",
     options=list(recipient_by_label.keys()),
@@ -286,9 +264,14 @@ selected_recipient_labels = st.multiselect(
 recipient_public_keys = []
 for label in selected_recipient_labels:
     row = recipient_by_label[label]
-    recipient_public_keys.append((row["username"], row["ecdh_public_pem"].encode("utf-8")))
+    recipient_public_keys.append(
+        (row["username"], row["ecdh_public_pem"].encode("utf-8"))
+    )
 if recipient_public_keys:
-    st.caption(f"Selected {len(recipient_public_keys)} recipient(s): " + ", ".join(label.split(" · ")[0] for label in selected_recipient_labels))
+    st.caption(
+        f"Selected {len(recipient_public_keys)} recipient(s): "
+        + ", ".join(label.split(" · ")[0] for label in selected_recipient_labels)
+    )
 uploaded_file = st.file_uploader(
     "Choose a file to secure",
     type=["txt", "csv", "json", "pdf", "png", "jpg", "jpeg", "bin"],
@@ -307,7 +290,9 @@ if st.button("Encrypt for recipient and sign", type="primary"):
         ):
             raise ValueError("Generate sender keys first.")
         if not recipient_public_keys:
-            raise ValueError("Select at least one approved recipient from the dropdown before encrypting.")
+            raise ValueError(
+                "Select at least one approved recipient from the dropdown before encrypting."
+            )
         if uploaded_file is None:
             raise ValueError("Choose a file first.")
         file_bytes = uploaded_file.getvalue()
@@ -319,22 +304,27 @@ if st.button("Encrypt for recipient and sign", type="primary"):
         for recipient_label, recipient_pub in recipient_public_keys:
             recipient_vk = ecdsa.VerifyingKey.from_pem(recipient_pub)
             if recipient_vk.curve != ecdsa.SECP256k1:
-                raise ValueError(f"Recipient '{recipient_label}' key must use SECP256K1.")
+                raise ValueError(
+                    f"Recipient '{recipient_label}' key must use SECP256K1."
+                )
             wrap_key = derive_ecdh_shared_key(SENDER_ECDH_PRIVATE, recipient_pub)
             wrap_nonce = os.urandom(12)
             wrap_cipher = AES.new(wrap_key, AES.MODE_GCM, nonce=wrap_nonce)
             wrapped_aes_key, wrap_tag = wrap_cipher.encrypt_and_digest(aes_key)
-            recipient_envelopes.append({
-                "fingerprint": hashlib.sha256(recipient_vk.to_pem()).hexdigest(),
-                "wrapped_key": wrapped_aes_key.hex(),
-                "wrap_nonce": wrap_nonce.hex(),
-                "wrap_tag": wrap_tag.hex(),
-            })
+            recipient_envelopes.append(
+                {
+                    "fingerprint": hashlib.sha256(recipient_vk.to_pem()).hexdigest(),
+                    "wrapped_key": wrapped_aes_key.hex(),
+                    "wrap_nonce": wrap_nonce.hex(),
+                    "wrap_tag": wrap_tag.hex(),
+                }
+            )
         encryption_ms = (time.perf_counter() - t0) * 1000
         package = {
             "version": 1,
             "algorithm": "AES-256-GCM",
             "transfer_id": uuid.uuid4().hex,
+            "sender_username": st.session_state.auth_username,
             "ciphertext": ciphertext,
             "nonce": nonce,
             "tag": tag,
@@ -346,28 +336,39 @@ if st.button("Encrypt for recipient and sign", type="primary"):
         t1 = time.perf_counter()
         signature = signing_key.sign(canonical, hashfunc=hashlib.sha256)
         signing_ms = (time.perf_counter() - t1) * 1000
-        st.session_state.sender_metrics.update({
-            "Original file size": f"{len(file_bytes):,} bytes",
-            "Encrypted payload size": f"{len(bytes.fromhex(ciphertext)):,} bytes",
-            "Encryption time (GCM)": f"{encryption_ms:.2f} ms",
-            "SECP256K1 signing time": f"{signing_ms:.2f} ms",
-        })
+        st.session_state.sender_metrics.update(
+            {
+                "Original file size": f"{len(file_bytes):,} bytes",
+                "Encrypted payload size": f"{len(bytes.fromhex(ciphertext)):,} bytes",
+                "Encryption time (GCM)": f"{encryption_ms:.2f} ms",
+                "SECP256K1 signing time": f"{signing_ms:.2f} ms",
+            }
+        )
         package["signature"] = signature.hex()
         package["sender_signing_public"] = SENDER_SIGN_PUBLIC.read_text()
         st.session_state.payload_to_store = json.dumps(
             package, sort_keys=True, separators=(",", ":")
         )
         st.session_state.last_filename = uploaded_file.name
-        st.session_state.sender_metrics["IPFS package size"] = f"{len(st.session_state.payload_to_store.encode('utf-8')):,} bytes"
+        st.session_state.sender_metrics["IPFS package size"] = (
+            f"{len(st.session_state.payload_to_store.encode('utf-8')):,} bytes"
+        )
         st.session_state.last_cid = st.session_state.last_hash = (
             st.session_state.last_tx
         ) = ""
-        st.success(f"File encrypted once with AES-256-GCM and signed for {len(recipient_envelopes)} recipient(s).")
-        package_digest = hashlib.sha256(st.session_state.payload_to_store.encode("utf-8")).hexdigest()
+        st.success(
+            f"File encrypted once with AES-256-GCM and signed for {len(recipient_envelopes)} recipient(s)."
+        )
+        package_digest = hashlib.sha256(
+            st.session_state.payload_to_store.encode("utf-8")
+        ).hexdigest()
         audit_manager.record_event(
-            event_id=f"sender:encrypt:{package_digest}", event_type="ENCRYPT_AND_SIGN",
-            status="PASS", package_sha256=package_digest,
-            details=f"Encrypted and signed uploaded file name={uploaded_file.name!r}; plaintext is not stored in audit log.")
+            event_id=f"sender:encrypt:{package_digest}",
+            event_type="ENCRYPT_AND_SIGN",
+            status="PASS",
+            package_sha256=package_digest,
+            details=f"Encrypted and signed uploaded file name={uploaded_file.name!r}; plaintext is not stored in audit log.",
+        )
         a, b, c = st.columns(3)
         a.metric("Original size", f"{len(file_bytes):,} bytes")
         b.metric("Ciphertext", f"{len(bytes.fromhex(ciphertext)):,} bytes")
@@ -379,7 +380,9 @@ st.markdown(
     "**View IPFS node in the official Web UI:** "
     "[Open IPFS Web UI](http://127.0.0.1:5001/webui)"
 )
-st.caption("This opens your local Kubo IPFS interface in a new browser tab. Start the IPFS daemon first.")
+st.caption(
+    "This opens your local Kubo IPFS interface in a new browser tab. Start the IPFS daemon first."
+)
 
 if st.session_state.payload_to_store:
     st.download_button(
@@ -392,23 +395,34 @@ if st.session_state.payload_to_store:
     if st.button("Upload encrypted package to IPFS"):
         try:
             ipfs_started = time.perf_counter()
-            st.session_state.last_cid = ipfs_manager.upload_data(
-                st.session_state.payload_to_store
+            st.session_state.last_cid = api_client.upload_package(
+                st.session_state.api_token,
+                st.session_state.payload_to_store,
             )
-            st.session_state.sender_metrics["IPFS upload time"] = f"{(time.perf_counter() - ipfs_started) * 1000:.2f} ms"
+            st.session_state.sender_metrics["IPFS upload time"] = (
+                f"{(time.perf_counter() - ipfs_started) * 1000:.2f} ms"
+            )
             st.session_state.last_hash = hashlib.sha256(
                 st.session_state.payload_to_store.encode()
             ).hexdigest()
             audit_manager.record_event(
                 event_id=f"sender:ipfs:{st.session_state.last_cid}:{st.session_state.last_hash}",
-                event_type="IPFS_UPLOAD", status="PASS", cid=st.session_state.last_cid,
-                package_sha256=st.session_state.last_hash, details="Encrypted package uploaded to IPFS.")
+                event_type="IPFS_UPLOAD",
+                status="PASS",
+                cid=st.session_state.last_cid,
+                package_sha256=st.session_state.last_hash,
+                details="Encrypted package uploaded to IPFS.",
+            )
             st.success("Encrypted package uploaded to IPFS.")
         except Exception as e:
             audit_manager.record_event(
-                event_id=f"sender:ipfs-error:{hashlib.sha256((str(st.session_state.last_cid)+str(e)).encode()).hexdigest()}",
-                event_type="IPFS_UPLOAD", status="ERROR", cid=st.session_state.last_cid,
-                package_sha256=st.session_state.last_hash, details=str(e))
+                event_id=f"sender:ipfs-error:{hashlib.sha256((str(st.session_state.last_cid) + str(e)).encode()).hexdigest()}",
+                event_type="IPFS_UPLOAD",
+                status="ERROR",
+                cid=st.session_state.last_cid,
+                package_sha256=st.session_state.last_hash,
+                details=str(e),
+            )
             st.error(f"IPFS upload failed: {e}")
 
 if st.session_state.last_cid:
@@ -432,50 +446,69 @@ if st.session_state.last_cid:
     st.header("4. Anchor on blockchain")
     if st.button("Record CID and hash on blockchain"):
         try:
-            address = get_or_deploy_contract()
             anchor_started = time.perf_counter()
-            receipt = blockchain_manager.store_record(
-                cid=st.session_state.last_cid,
-                data_hash=st.session_state.last_hash,
-                contract_address=address,
-                abi=MINIMAL_ABI,
+            result = api_client.anchor_blockchain_record(
+                st.session_state.api_token,
+                st.session_state.last_cid,
+                st.session_state.last_hash,
             )
-            tx = receipt.get("transactionHash", receipt.get("transaction_hash", ""))
-            if hasattr(tx, "hex"):
-                tx = tx.hex()
-            st.session_state.last_tx = str(tx)
-            st.session_state.sender_metrics["Blockchain confirmation time"] = f"{(time.perf_counter() - anchor_started) * 1000:.2f} ms"
-            meta = blockchain_manager.get_receipt_metadata(receipt)
-            gas_metrics = blockchain_manager.transaction_cost_metrics(receipt)
-            st.session_state.sender_metrics["Gas used per anchor"] = str(gas_metrics.get("gas_used") or "Unavailable")
-            st.session_state.sender_metrics["Blockchain transaction cost (ETH)"] = (f"{gas_metrics['cost_eth']:.8f} ETH" if gas_metrics.get("cost_eth") is not None else "Unavailable")
+            if result.get("status") != "PASS":
+                raise RuntimeError(result.get("message", "Blockchain anchoring failed."))
+
+            st.session_state.last_tx = result["transaction_hash"]
+            st.session_state.sender_metrics["Blockchain confirmation time"] = (
+                f"{(time.perf_counter() - anchor_started) * 1000:.2f} ms"
+            )
+            st.session_state.sender_metrics["Gas used per anchor"] = str(
+                result.get("gas_used") or "Unavailable"
+            )
+            cost_eth = result.get("cost_eth")
+            st.session_state.sender_metrics["Blockchain transaction cost (ETH)"] = (
+                f"{cost_eth:.8f} ETH" if cost_eth is not None else "Unavailable"
+            )
+
             audit_manager.record_event(
-                event_id=f"sender:anchor:{st.session_state.last_tx or st.session_state.last_cid}",
-                event_type="BLOCKCHAIN_ANCHOR", status="PASS", cid=st.session_state.last_cid,
-                package_sha256=st.session_state.last_hash, block_number=meta.get("block_number"),
-                blockchain_timestamp_utc=meta.get("blockchain_timestamp_utc", ""),
+                event_id=f"sender:anchor:{st.session_state.last_tx}",
+                event_type="BLOCKCHAIN_ANCHOR",
+                status="PASS",
+                cid=st.session_state.last_cid,
+                package_sha256=st.session_state.last_hash,
+                block_number=result.get("block_number"),
+                blockchain_timestamp_utc=result.get("blockchain_timestamp_utc", ""),
                 transaction_hash=st.session_state.last_tx,
-                details="CID and package SHA-256 commitment anchored on chain." + (f" Block metadata note: {meta['metadata_error']}" if meta.get("metadata_error") else ""))
-            st.success("CID and hash anchored on the local blockchain.")
+                details="CID and package SHA-256 commitment anchored through the central blockchain API.",
+            )
+            st.success("CID and hash anchored on the central blockchain.")
             g1, g2 = st.columns(2)
-            g1.metric("Anchor gas used", str(gas_metrics.get("gas_used") or "Unavailable"))
-            g2.metric("Estimated transaction cost (ETH)", f"{gas_metrics['cost_eth']:.8f}" if gas_metrics.get("cost_eth") is not None else "Unavailable")
+            g1.metric("Anchor gas used", str(result.get("gas_used") or "Unavailable"))
+            g2.metric(
+                "Estimated transaction cost (ETH)",
+                f"{cost_eth:.8f}" if cost_eth is not None else "Unavailable",
+            )
         except Exception as e:
             audit_manager.record_event(
                 event_id=f"sender:anchor-error:{st.session_state.last_cid}:{st.session_state.last_hash}",
-                event_type="BLOCKCHAIN_ANCHOR", status="ERROR", cid=st.session_state.last_cid,
-                package_sha256=st.session_state.last_hash, details=str(e))
+                event_type="BLOCKCHAIN_ANCHOR",
+                status="ERROR",
+                cid=st.session_state.last_cid,
+                package_sha256=st.session_state.last_hash,
+                details=str(e),
+            )
             st.error(f"Blockchain anchoring failed: {e}")
     if st.session_state.last_tx:
         st.code(st.session_state.last_tx)
 
 st.divider()
 st.header("📊 Sender Performance Metrics")
-st.caption("Actual measurements from sender operations in this Streamlit session. Unperformed operations remain 'Not measured yet'.")
+st.caption(
+    "Actual measurements from sender operations in this Streamlit session. Unperformed operations remain 'Not measured yet'."
+)
 _sender_metric_items = list(st.session_state.sender_metrics.items())
 for _row_start in range(0, len(_sender_metric_items), 3):
     _cols = st.columns(3)
-    for _col, (_label, _value) in zip(_cols, _sender_metric_items[_row_start:_row_start + 3]):
+    for _col, (_label, _value) in zip(
+        _cols, _sender_metric_items[_row_start : _row_start + 3]
+    ):
         _col.metric(_label, _value if _value is not None else "Not measured yet")
 
 st.caption(

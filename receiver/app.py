@@ -1,4 +1,3 @@
-import glob
 import hashlib
 import json
 import os
@@ -9,91 +8,14 @@ from pathlib import Path
 import ecdsa
 import streamlit as st
 from Crypto.Cipher import AES
-from web3 import Web3
 
 BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 import audit_manager
 import audit_policy
-import blockchain_manager
-import ipfs_manager
+from package_verification import verify_sender_signature
 
-
-# ==========================================
-# AUTOMATIC SMART CONTRACT DEPLOYER
-# ==========================================
-def get_or_deploy_contract():
-    w3 = Web3(Web3.HTTPProvider("http://127.0.0.1:8545"))
-    if not w3.is_connected():
-        raise RuntimeError(
-            "Hardhat RPC is unavailable at http://127.0.0.1:8545. Start npx hardhat node first."
-        )
-
-    addr_file = str(
-        Path(__file__).resolve().parents[1] / "blockchain" / "contract_address.txt"
-    )
-    if os.path.exists(addr_file):
-        with open(addr_file, "r") as f:
-            saved_addr = f.read().strip()
-        try:
-            if w3.eth.get_code(Web3.to_checksum_address(saved_addr)) not in (
-                b"",
-                b"\x00",
-            ):
-                return saved_addr
-        except Exception:
-            pass
-
-    artifacts_root = Path(__file__).resolve().parents[1] / "blockchain"
-    files = glob.glob(
-        str(artifacts_root / "artifacts/contracts/**/DataStorage.json"), recursive=True
-    )
-    files = [f for f in files if not f.endswith(".dbg.json")]
-    if not files:
-        raise FileNotFoundError(
-            "Compiled contract artifact not found. Install Hardhat and run npx hardhat compile in the blockchain folder."
-        )
-
-    with open(files[0], "r") as f:
-        data = json.load(f)
-
-    w3.eth.default_account = w3.eth.accounts[0]
-    Contract = w3.eth.contract(abi=data["abi"], bytecode=data["bytecode"])
-    tx_hash = Contract.constructor().transact()
-    receipt = w3.eth.wait_for_transaction_receipt(tx_hash)
-
-    new_addr = receipt.contractAddress
-    with open(addr_file, "w") as f:
-        f.write(new_addr)
-
-    return new_addr
-
-
-MINIMAL_ABI = [
-    {
-        "inputs": [
-            {"internalType": "string", "name": "_cid", "type": "string"},
-            {"internalType": "string", "name": "_dataHash", "type": "string"},
-        ],
-        "name": "storeRecord",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-    {
-        "inputs": [{"internalType": "string", "name": "", "type": "string"}],
-        "name": "records",
-        "outputs": [
-            {"internalType": "string", "name": "cid", "type": "string"},
-            {"internalType": "string", "name": "dataHash", "type": "string"},
-            {"internalType": "address", "name": "sender", "type": "address"},
-            {"internalType": "uint256", "name": "timestamp", "type": "uint256"},
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    },
-]
 
 # ==========================================
 # CRYPTOGRAPHIC HELPERS: ECDH + HKDF + AES-GCM
@@ -176,13 +98,37 @@ def decrypt_gcm(ciphertext_hex, nonce_hex, tag_hex, aes_key):
 
 
 def canonical_package_fields(package):
-    # New multi-recipient packages sign the complete recipient-key envelope.
-    # Keep legacy canonicalization so previously stored v1 packages still verify.
+    """Return deterministic bytes for every security-relevant package field."""
     if "recipient_keys" in package:
-        names = ("version", "algorithm", "transfer_id", "ciphertext", "nonce", "tag", "recipient_keys", "sender_ecdh_public")
+        names = (
+            "version",
+            "algorithm",
+            "transfer_id",
+            "sender_username",
+            "ciphertext",
+            "nonce",
+            "tag",
+            "recipient_keys",
+            "sender_ecdh_public",
+        )
     else:
-        names = ("version", "algorithm", "transfer_id", "ciphertext", "nonce", "tag", "recipient_ecdh_fingerprint", "sender_ecdh_public")
-    fields = {k: package[k] for k in names}
+        # Legacy package shape retained for parsing older records. New receiver
+        # verification still requires sender_username and trusted-key approval.
+        names = (
+            "version",
+            "algorithm",
+            "transfer_id",
+            "sender_username",
+            "ciphertext",
+            "nonce",
+            "tag",
+            "recipient_ecdh_fingerprint",
+            "sender_ecdh_public",
+        )
+    missing = [name for name in names if name not in package]
+    if missing:
+        raise ValueError(f"Package is missing signed fields: {', '.join(missing)}")
+    fields = {name: package[name] for name in names}
     return json.dumps(fields, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
@@ -190,13 +136,17 @@ st.set_page_config(
     page_title="Secure Storage — Receiver", page_icon="📥", layout="wide"
 )
 
-# --- Authentication and administrator approval gate ---
-from auth_manager import (authenticate, register_user, get_user, ensure_identity, log_event, publish_receiver_public_key)
+# --- Central API authentication and administrator approval gate ---
+import api_client
+from auth_manager import ensure_identity
 
 if "auth_username" not in st.session_state:
     st.session_state.auth_username = None
-if not st.session_state.auth_username:
-    st.subheader("Client sign in / registration")
+if "api_token" not in st.session_state:
+    st.session_state.api_token = None
+
+if not st.session_state.api_token:
+    st.subheader("Central account sign in / registration")
     mode = st.radio("Choose", ["Sign in", "Register new receiver"], horizontal=True)
     with st.form("receiver_auth_form"):
         username = st.text_input("Username")
@@ -205,31 +155,38 @@ if not st.session_state.auth_username:
     if submitted:
         try:
             if mode == "Register new receiver":
-                register_user(username, password, "receiver")
-                st.success("Registration submitted. An administrator must approve your account before access is enabled.")
+                result = api_client.register(username, password, "receiver")
+                st.success(
+                    result.get("message", "Registration submitted for admin approval.")
+                )
             else:
-                user = authenticate(username, password)
-                if not user:
-                    st.error("Invalid username or password.")
-                elif user["role"] != "receiver":
+                result = api_client.login(username, password)
+                user = result["user"]
+                if user["role"] != "receiver":
                     st.error("This account is not a receiver account.")
-                elif user["status"] != "approved":
-                    st.warning(f"Account status: {user['status']}. Please wait for administrator approval.")
                 else:
+                    st.session_state.api_token = result["access_token"]
                     st.session_state.auth_username = user["username"]
                     st.rerun()
         except Exception as exc:
             st.error(str(exc))
     st.stop()
 
-_current_user = get_user(st.session_state.auth_username)
-if not _current_user or _current_user["role"] != "receiver" or _current_user["status"] != "approved":
+try:
+    _current_user = api_client.me(st.session_state.api_token)
+except Exception as exc:
+    st.session_state.api_token = None
     st.session_state.auth_username = None
-    st.error("This account is not approved. Please sign in again after administrator approval.")
+    st.error(f"Central API session expired or unavailable: {exc}")
     st.stop()
-# IMPORTANT SECURITY FIX: each receiver account gets its own local key directory.
-# Previously all accounts on this installation used receiver/keys/recipient_ecdh_private.pem,
-# so logging in as B could use the same cryptographic identity as A.
+
+if _current_user["role"] != "receiver":
+    st.session_state.api_token = None
+    st.session_state.auth_username = None
+    st.error("This account is not a receiver account.")
+    st.stop()
+
+# Receiver private keys remain in this account's local key directory.
 _receiver_username = _current_user["username"]
 KEY_DIR = Path(__file__).resolve().parent / "keys" / _receiver_username
 KEY_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -242,14 +199,22 @@ RECIPIENT_ECDH_PUBLIC = KEY_DIR / "recipient_ecdh_public.pem"
 RECIPIENT_SIGN_PRIVATE = KEY_DIR / "recipient_sign_private.pem"
 RECIPIENT_SIGN_PUBLIC = KEY_DIR / "recipient_sign_public.pem"
 if st.button("Sign out", key="auth_signout"):
-    log_event(st.session_state.auth_username, "logout", "receiver portal")
+    try:
+        api_client.log_event(st.session_state.api_token, "logout", "receiver portal")
+    except Exception:
+        pass
+    st.session_state.api_token = None
     st.session_state.auth_username = None
     st.rerun()
 st.caption(f"Signed in as **{st.session_state.auth_username}** · approved receiver")
-# Auto-provision keys once after approval. Existing keys are never overwritten automatically.
+# Private identity remains on the receiver device; publish only its public ECDH key.
 ensure_identity("recipient", KEY_DIR, generate_identity)
-# Publish only the public ECDH key into the shared approved-recipient registry.
-publish_receiver_public_key(st.session_state.auth_username, RECIPIENT_ECDH_PUBLIC.read_bytes())
+try:
+    api_client.publish_receiver_key(
+        st.session_state.api_token, RECIPIENT_ECDH_PUBLIC.read_text(encoding="utf-8")
+    )
+except Exception as exc:
+    st.error(f"Could not publish receiver public key to central API: {exc}")
 
 
 st.title("📥 Receiver Portal")
@@ -261,7 +226,9 @@ if "receiver_metrics" not in st.session_state:
         "Decryption time (GCM)": None,
     }
 
-st.info("Cryptographic keys are provisioned automatically after administrator approval and are not replaced on login. In this single-machine demo, trusted public keys are loaded from the local Sender portal automatically.")
+st.info(
+    "Cryptographic keys are provisioned locally after administrator approval. Only the receiver public ECDH key is published to the central API; private keys remain on this device."
+)
 
 st.divider()
 st.header("2. Fetch, verify and decrypt")
@@ -294,27 +261,30 @@ if st.button("Fetch, verify and decrypt", type="primary"):
             fail_check("Input validation", "Enter the CID from the sender.")
         if not RECIPIENT_ECDH_PRIVATE.exists() or not RECIPIENT_ECDH_PUBLIC.exists():
             fail_check("Recipient identity", "Generate recipient keys first.")
-        if not TRUSTED_SENDER_ECDH_PUBLIC.exists() or not TRUSTED_SENDER_SIGN_PUBLIC.exists():
+        if not TRUSTED_SENDER_ECDH_PUBLIC.exists():
             fail_check(
-                "Trusted sender keys",
-                "Sender identity is not available locally. Approve and sign in to a Sender account first.",
+                "Sender ECDH key",
+                "Sender ECDH public key is not available in this single-machine demo.",
             )
         try:
-            sender_ecdh_text = TRUSTED_SENDER_ECDH_PUBLIC.read_text(encoding="utf-8").strip()
-            sender_sign_text = TRUSTED_SENDER_SIGN_PUBLIC.read_text(encoding="utf-8").strip()
+            sender_ecdh_text = TRUSTED_SENDER_ECDH_PUBLIC.read_text(
+                encoding="utf-8"
+            ).strip()
         except (OSError, UnicodeDecodeError) as exc:
-            fail_check("Trusted sender keys", f"Could not load local Sender public keys: {type(exc).__name__}.")
-        if not sender_ecdh_text or not sender_sign_text:
-            fail_check("Trusted sender keys", "One or both local Sender public-key files are empty.")
+            fail_check(
+                "Sender ECDH key",
+                f"Could not load local Sender ECDH public key: {type(exc).__name__}.",
+            )
+        if not sender_ecdh_text:
+            fail_check("Sender ECDH key", "Local Sender ECDH public-key file is empty.")
         add_check(
             "Input and key availability",
             "PASS",
             "CID, recipient identity, and locally registered sender public keys are present.",
         )
 
-        address = get_or_deploy_contract()
-        chain_result = blockchain_manager.verify_record_result(
-            cid=cid.strip(), contract_address=address, abi=MINIMAL_ABI
+        chain_result = api_client.verify_blockchain_record(
+            st.session_state.api_token, cid.strip()
         )
         if chain_result["status"] != "PASS":
             add_check(
@@ -331,7 +301,10 @@ if st.button("Fetch, verify and decrypt", type="primary"):
         )
 
         ipfs_started = time.perf_counter()
-        ipfs_result = ipfs_manager.retrieve_file_result(record["cid"])
+        ipfs_result = api_client.retrieve_package_result(
+            st.session_state.api_token,
+            record["cid"],
+        )
         st.session_state.receiver_metrics["IPFS download time"] = (
             f"{(time.perf_counter() - ipfs_started) * 1000:.2f} ms"
             if ipfs_result["status"] == "PASS"
@@ -407,55 +380,92 @@ if st.button("Fetch, verify and decrypt", type="primary"):
                 "Sender ECDH key binding",
                 "Sender ECDH public key does not match package metadata.",
             )
-        if package.get("sender_signing_public", "").strip() != sender_sign_text.strip():
+        sender_username = package.get("sender_username")
+        if not isinstance(sender_username, str) or not sender_username.strip():
             fail_check(
-                "Sender signing key binding",
-                "Signing key does not match package metadata. Verify it through a trusted channel.",
+                "Sender identity", "Package has no authenticated sender username."
+            )
+        if sender_username != sender_username.strip():
+            fail_check(
+                "Sender identity",
+                "Sender username contains invalid surrounding whitespace.",
             )
         add_check(
-            "Sender public-key binding",
+            "Sender ECDH key binding",
             "PASS",
-            "Both sender public keys match package metadata.",
+            "Sender ECDH public key matches the locally configured sender identity.",
         )
 
         recipient_envelope = None
         if "recipient_keys" in package:
-            if not isinstance(package["recipient_keys"], list) or not package["recipient_keys"]:
-                fail_check("Recipient binding", "Recipient envelope list is malformed or empty; refusing legacy fallback.")
+            if (
+                not isinstance(package["recipient_keys"], list)
+                or not package["recipient_keys"]
+            ):
+                fail_check(
+                    "Recipient binding",
+                    "Recipient envelope list is malformed or empty; refusing legacy fallback.",
+                )
             recipient_envelope = next(
-                (entry for entry in package["recipient_keys"]
-                 if isinstance(entry, dict) and entry.get("fingerprint") == recipient_fingerprint),
+                (
+                    entry
+                    for entry in package["recipient_keys"]
+                    if isinstance(entry, dict)
+                    and entry.get("fingerprint") == recipient_fingerprint
+                ),
                 None,
             )
             if recipient_envelope is None:
-                fail_check("Recipient binding", "This recipient's public-key fingerprint is not authorized for the package.")
+                fail_check(
+                    "Recipient binding",
+                    "This recipient's public-key fingerprint is not authorized for the package.",
+                )
             required_envelope_fields = ("wrapped_key", "wrap_nonce", "wrap_tag")
-            if any(not isinstance(recipient_envelope.get(k), str) or not recipient_envelope.get(k) for k in required_envelope_fields):
+            if any(
+                not isinstance(recipient_envelope.get(k), str)
+                or not recipient_envelope.get(k)
+                for k in required_envelope_fields
+            ):
                 fail_check("Recipient binding", "Recipient key envelope is incomplete.")
-            add_check("Recipient binding", "PASS", "A recipient-specific wrapped AES key is present for this identity.")
+            add_check(
+                "Recipient binding",
+                "PASS",
+                "A recipient-specific wrapped AES key is present for this identity.",
+            )
         else:
             # Legacy packages are accepted only when explicitly bound to this account's unique key.
             if package.get("recipient_ecdh_fingerprint") != recipient_fingerprint:
-                fail_check("Recipient binding", "Package was encrypted for a different recipient ECDH key.")
-            add_check("Recipient binding", "PASS", "Legacy package is bound to this recipient's ECDH key.")
+                fail_check(
+                    "Recipient binding",
+                    "Package was encrypted for a different recipient ECDH key.",
+                )
+            add_check(
+                "Recipient binding",
+                "PASS",
+                "Legacy package is bound to this recipient's ECDH key.",
+            )
 
-        canonical = canonical_package_fields(package)
         try:
             t0 = time.perf_counter()
-            sender_vk = ecdsa.VerifyingKey.from_pem(sender_sign_text.encode("utf-8"))
-            sender_vk.verify(
-                bytes.fromhex(package["signature"]), canonical, hashfunc=hashlib.sha256
-            )
+            signature_ok = verify_sender_signature(package, sender_username)
             verify_ms = (time.perf_counter() - t0) * 1000
         except Exception as exc:
-            fail_check("Sender signature", f"Signature verification failed: {exc}")
+            fail_check(
+                "Sender signature",
+                f"Trusted-key verification failed: {type(exc).__name__}.",
+            )
+        if not signature_ok:
+            fail_check(
+                "Sender signature",
+                f"Sender '{sender_username}' is not trusted or the package signature is invalid.",
+            )
         st.session_state.receiver_metrics["Signature verification time"] = (
             f"{verify_ms:.2f} ms"
         )
         add_check(
             "Sender signature",
             "PASS",
-            "Signature is valid under the supplied trusted signing public key.",
+            "Sender identity is approved in the local trust store and the package signature is valid.",
         )
 
         # Derive/decrypt only after all preceding checks have passed.
@@ -465,7 +475,8 @@ if st.button("Fetch, verify and decrypt", type="primary"):
             )
             if recipient_envelope is not None:
                 unwrap_cipher = AES.new(
-                    shared_key, AES.MODE_GCM,
+                    shared_key,
+                    AES.MODE_GCM,
                     nonce=bytes.fromhex(recipient_envelope["wrap_nonce"]),
                 )
                 aes_key = unwrap_cipher.decrypt_and_verify(
@@ -634,8 +645,16 @@ attack_package_upload = st.file_uploader(
     key="manual_attack_package",
 )
 # The test lab also uses locally registered Sender public keys; only the package may be uploaded for tampering tests.
-attack_sender_ecdh_pem = TRUSTED_SENDER_ECDH_PUBLIC.read_bytes() if TRUSTED_SENDER_ECDH_PUBLIC.exists() else None
-attack_sender_sign_pem = TRUSTED_SENDER_SIGN_PUBLIC.read_bytes() if TRUSTED_SENDER_SIGN_PUBLIC.exists() else None
+attack_sender_ecdh_pem = (
+    TRUSTED_SENDER_ECDH_PUBLIC.read_bytes()
+    if TRUSTED_SENDER_ECDH_PUBLIC.exists()
+    else None
+)
+attack_sender_sign_pem = (
+    TRUSTED_SENDER_SIGN_PUBLIC.read_bytes()
+    if TRUSTED_SENDER_SIGN_PUBLIC.exists()
+    else None
+)
 
 
 def _manual_add(rows, check, status, detector, details):
@@ -679,7 +698,6 @@ def _manual_diagnose(raw_bytes, ecdh_pem, sign_pem):
         "ciphertext",
         "nonce",
         "tag",
-        "recipient_ecdh_fingerprint",
         "sender_ecdh_public",
         "sender_signing_public",
         "signature",
@@ -1008,11 +1026,8 @@ else:
                 )
             else:
                 try:
-                    address = get_or_deploy_contract()
-                    record = blockchain_manager.verify_record_result(
-                        cid=cid_to_test.strip(),
-                        contract_address=address,
-                        abi=MINIMAL_ABI,
+                    record = api_client.verify_blockchain_record(
+                        st.session_state.api_token, cid_to_test.strip()
                     )
                     status = record.get("status", "ERROR")
                     st.write(f"**Result:** {status}")
