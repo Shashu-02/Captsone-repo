@@ -27,6 +27,8 @@ def canonical_package_fields(package: dict) -> bytes:
             "recipient_keys",
             "sender_ecdh_public",
         )
+        if "original_filename" in package:
+            names = names + ("original_filename",)
     else:
         names = (
             "version",

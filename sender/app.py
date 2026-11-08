@@ -13,14 +13,12 @@ from Crypto.Cipher import AES
 BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
-import audit_manager
-
-
 # ==========================================
 # CRYPTOGRAPHIC HELPERS: ECDH + HKDF + AES-GCM
 # ==========================================
 from pathlib import Path
 
+import audit_manager
 from Crypto.Hash import SHA256
 from Crypto.Protocol.KDF import HKDF
 
@@ -109,6 +107,8 @@ def canonical_package_fields(package):
             "recipient_keys",
             "sender_ecdh_public",
         )
+        if "original_filename" in package:
+            names = names + ("original_filename",)
     else:
         # Legacy package shape retained for parsing older records. New receiver
         # verification still requires sender_username and trusted-key approval.
@@ -273,8 +273,8 @@ if recipient_public_keys:
         + ", ".join(label.split(" · ")[0] for label in selected_recipient_labels)
     )
 uploaded_file = st.file_uploader(
-    "Choose a file to secure",
-    type=["txt", "csv", "json", "pdf", "png", "jpg", "jpeg", "bin"],
+    "Choose a file to secure (any file type)",
+    type=None,
     key="sender_file_upload",
 )
 if st.button("Encrypt for recipient and sign", type="primary"):
@@ -330,6 +330,7 @@ if st.button("Encrypt for recipient and sign", type="primary"):
             "tag": tag,
             "recipient_keys": recipient_envelopes,
             "sender_ecdh_public": SENDER_ECDH_PUBLIC.read_text(),
+            "original_filename": Path(uploaded_file.name.replace("\\", "/")).name,
         }
         canonical = canonical_package_fields(package)
         signing_key = ecdsa.SigningKey.from_pem(SENDER_SIGN_PRIVATE.read_bytes())
@@ -454,7 +455,9 @@ if st.session_state.last_cid:
                 st.session_state.last_hash,
             )
             if result.get("status") != "PASS":
-                raise RuntimeError(result.get("message", "Blockchain anchoring failed."))
+                raise RuntimeError(
+                    result.get("message", "Blockchain anchoring failed.")
+                )
 
             st.session_state.last_tx = result["transaction_hash"]
             st.session_state.sender_metrics["Blockchain confirmation time"] = (

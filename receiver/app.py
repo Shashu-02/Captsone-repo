@@ -1,5 +1,6 @@
 import hashlib
 import json
+import mimetypes
 import os
 import sys
 import time
@@ -12,18 +13,16 @@ from Crypto.Cipher import AES
 BACKEND_DIR = Path(__file__).resolve().parents[1] / "backend"
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
-import audit_manager
-import audit_policy
-from package_verification import verify_sender_signature
-
-
 # ==========================================
 # CRYPTOGRAPHIC HELPERS: ECDH + HKDF + AES-GCM
 # ==========================================
 from pathlib import Path
 
+import audit_manager
+import audit_policy
 from Crypto.Hash import SHA256
 from Crypto.Protocol.KDF import HKDF
+from package_verification import verify_sender_signature
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 KEY_DIR = Path(__file__).resolve().parent / "keys"
@@ -111,6 +110,8 @@ def canonical_package_fields(package):
             "recipient_keys",
             "sender_ecdh_public",
         )
+        if "original_filename" in package:
+            names = names + ("original_filename",)
     else:
         # Legacy package shape retained for parsing older records. New receiver
         # verification still requires sender_username and trusted-key approval.
@@ -585,12 +586,29 @@ if st.button("Fetch, verify and decrypt", type="primary"):
         a, b = st.columns(2)
         a.metric("Signature verification", f"{verify_ms:.2f} ms")
         b.metric("Decryption", f"{decrypt_ms:.2f} ms")
-        filename = st.text_input("Output filename", value="recovered_file.bin")
+        # The original filename is authenticated because it is part of the
+        # sender-signed canonical package fields. Sanitize it to a basename so
+        # a package cannot choose a filesystem path.
+        packaged_name = package.get("original_filename", "recovered_file.bin")
+        if not isinstance(packaged_name, str):
+            packaged_name = "recovered_file.bin"
+        safe_name = Path(packaged_name.replace("\\", "/")).name
+        if not safe_name or safe_name in {".", ".."}:
+            safe_name = "recovered_file.bin"
+        suggested_name = st.text_input(
+            "Output filename", value=safe_name, key="verified_output_filename"
+        )
+        output_name = Path(suggested_name.replace("\\", "/")).name
+        if not output_name or output_name in {".", ".."}:
+            output_name = safe_name
+        download_mime = (
+            mimetypes.guess_type(output_name)[0] or "application/octet-stream"
+        )
         st.download_button(
             "Download verified file",
             plaintext,
-            file_name=filename.strip() or "recovered_file.bin",
-            mime="application/octet-stream",
+            file_name=output_name,
+            mime=download_mime,
         )
     else:
         final_status = (
