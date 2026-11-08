@@ -1,0 +1,16 @@
+scenario,label,risk_score,risk_level,predicted_risky_at_25,priority_signals,historical_failure_count
+attack_signature_invalid,1,50,HIGH,1,signature_invalid,0
+attack_commitment_changed,1,45,MEDIUM,1,commitment_changed,0
+attack_missing_blockchain_record,1,35,MEDIUM,1,blockchain_record_missing,0
+attack_wrong_recipient,1,30,MEDIUM,1,recipient_key_mismatch,0
+attack_replay,1,30,MEDIUM,1,replay_detected,0
+attack_repeated_failures,1,40,MEDIUM,1,repeated_failures;verification_failure,4
+attack_mixed_signals,1,95,HIGH,1,signature_invalid;commitment_changed,0
+normal_successful_transfer,0,0,LOW,0,,0
+normal_successful_transfer_2,0,0,LOW,0,,0
+normal_successful_transfer_3,0,0,LOW,0,,0
+normal_no_events,0,0,LOW,0,,0
+benign_ipfs_outage,0,0,LOW,0,,0
+benign_blockchain_outage,0,0,LOW,0,,0
+benign_generic_verification_error,0,10,LOW,0,verification_failure,0
+benign_multiple_infrastructure_outages,0,0,LOW,0,,0

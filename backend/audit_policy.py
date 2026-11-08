@@ -1,23 +1,30 @@
 """24-hour rolling risk policy with exponential decay for historical failures.
 
+Security-risk scoring is separated from infrastructure availability warnings.
 This is a triage mechanism only. It never replaces or bypasses mandatory
 cryptographic verification.
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import math
 import time
+from datetime import datetime, timezone
 
+# Security-related signals only.
 WEIGHTS = {
     "signature_invalid": 50,
     "commitment_changed": 45,
     "blockchain_record_missing": 35,
     "recipient_key_mismatch": 30,
     "replay_detected": 30,
-    "ipfs_unavailable": 15,
-    "blockchain_unavailable": 15,
     "verification_failure": 10,
+}
+
+# Operational signals are reported separately, not added to attack risk.
+AVAILABILITY_SIGNALS = {
+    "ipfs_unavailable",
+    "blockchain_unavailable",
 }
 
 HISTORY_WINDOW_HOURS = 24
@@ -41,27 +48,49 @@ def _parse_utc_timestamp(value):
 
 
 def classify_event(event_type: str, status: str, details: str = "") -> list[str]:
-    """Map a verification/audit event to risk signals."""
+    """Map a verification/audit event to security or availability signals."""
     text = f"{event_type} {details}".lower()
     status_text = str(status).upper()
     signals = []
 
     if "signature" in text and status_text in {"FAIL", "ERROR"}:
         signals.append("signature_invalid")
-    if any(x in text for x in ("commitment", "hash mismatch", "sha-256")) and status_text == "FAIL":
+
+    if (
+        any(x in text for x in ("commitment", "hash mismatch", "sha-256"))
+        and status_text == "FAIL"
+    ):
         signals.append("commitment_changed")
-    if any(x in text for x in ("recipient binding", "recipient key", "different recipient")) and status_text == "FAIL":
+
+    if (
+        any(
+            x in text
+            for x in ("recipient binding", "recipient key", "different recipient")
+        )
+        and status_text == "FAIL"
+    ):
         signals.append("recipient_key_mismatch")
+
     if "replay" in text and status_text == "FAIL":
         signals.append("replay_detected")
+
     if "blockchain" in text and status_text == "ERROR":
         signals.append("blockchain_unavailable")
+
     if "ipfs" in text and status_text == "ERROR":
         signals.append("ipfs_unavailable")
-    if any(x in text for x in ("no matching on-chain", "record missing", "invalid cid")) and status_text == "FAIL":
+
+    if (
+        any(
+            x in text for x in ("no matching on-chain", "record missing", "invalid cid")
+        )
+        and status_text == "FAIL"
+    ):
         signals.append("blockchain_record_missing")
+
     if status_text in {"FAIL", "ERROR"} and not signals:
         signals.append("verification_failure")
+
     return signals
 
 
@@ -72,9 +101,11 @@ def _historical_failure_weight(event: dict, now: datetime) -> float:
     )
     if timestamp is None:
         return 0.0
+
     age_hours = (now - timestamp).total_seconds() / 3600.0
     if age_hours < 0 or age_hours > HISTORY_WINDOW_HOURS:
         return 0.0
+
     return math.pow(0.5, age_hours / HISTORY_HALF_LIFE_HOURS)
 
 
@@ -84,15 +115,17 @@ def assess_risk(
     *,
     now: datetime | None = None,
 ) -> dict:
-    """Calculate an explainable risk score from current signals and recent history.
+    """Calculate security risk separately from operational availability.
 
     Historical FAIL/ERROR events are limited to 24 hours and decay with a
     12-hour half-life. `now` is injectable for deterministic tests.
     """
     historical_events = historical_events or []
     current_time = now or datetime.now(timezone.utc)
+
     if current_time.tzinfo is None:
         current_time = current_time.replace(tzinfo=timezone.utc)
+
     current_time = current_time.astimezone(timezone.utc)
 
     signals = []
@@ -105,41 +138,57 @@ def assess_risk(
             )
         )
 
+    unique_signals = set(signals)
+    availability_warnings = sorted(unique_signals & AVAILABILITY_SIGNALS)
+    security_signals = unique_signals - AVAILABILITY_SIGNALS
+
     failures = [
-        event for event in historical_events
+        event
+        for event in historical_events
         if str(event.get("verification_status", event.get("status", ""))).upper()
         in {"FAIL", "ERROR"}
     ]
+
     weighted_failures = sum(
         _historical_failure_weight(event, current_time) for event in failures
     )
+
     in_window_count = sum(
-        1 for event in failures
-        if _historical_failure_weight(event, current_time) > 0
+        1 for event in failures if _historical_failure_weight(event, current_time) > 0
     )
 
-    current_signal_score = sum(WEIGHTS.get(s, 0) for s in set(signals))
+    current_signal_score = sum(WEIGHTS.get(signal, 0) for signal in security_signals)
+
     historical_penalty = min(
         MAX_HISTORICAL_PENALTY,
         max(0.0, weighted_failures - 1.0) * HISTORICAL_FAILURE_WEIGHT,
     )
+
     repeated = weighted_failures >= REPEATED_FAILURE_THRESHOLD
     repeated_penalty = REPEATED_FAILURE_PENALTY if repeated else 0
 
-    score = min(100, int(round(
-        current_signal_score + historical_penalty + repeated_penalty
-    )))
+    score = min(
+        100,
+        int(round(current_signal_score + historical_penalty + repeated_penalty)),
+    )
+
+    priority_signals = set(security_signals)
     if repeated:
-        signals.append("repeated_failures")
+        priority_signals.add("repeated_failures")
+
+    priority = sorted(
+        priority_signals,
+        key=lambda signal: WEIGHTS.get(signal, 20),
+        reverse=True,
+    )
 
     level = "HIGH" if score >= 50 else "MEDIUM" if score >= 25 else "LOW"
-    priority = sorted(
-        set(signals), key=lambda signal: WEIGHTS.get(signal, 20), reverse=True
-    )
+
     return {
         "risk_score": score,
         "risk_level": level,
         "priority_signals": priority,
+        "availability_warnings": availability_warnings,
         "historical_failure_count": in_window_count,
         "weighted_historical_failures": round(weighted_failures, 3),
         "historical_penalty": int(round(historical_penalty)),
@@ -147,9 +196,12 @@ def assess_risk(
         "history_window_hours": HISTORY_WINDOW_HOURS,
         "history_half_life_hours": HISTORY_HALF_LIFE_HOURS,
         "interpretation": (
-            "Triage score only. Historical FAIL/ERROR events are counted within "
-            "a 24-hour rolling window and decay with a 12-hour half-life. All "
-            "required cryptographic checks remain mandatory regardless of score."
+            "Security triage score only. Infrastructure availability warnings "
+            "are reported separately and do not independently increase the "
+            "security-risk score. Historical FAIL/ERROR events are counted "
+            "within a 24-hour rolling window and decay with a 12-hour "
+            "half-life. All required cryptographic checks remain mandatory "
+            "regardless of score."
         ),
     }
 
@@ -158,23 +210,53 @@ def synthetic_policy_benchmark(iterations: int = 1000) -> dict:
     """Benchmark signal classification only, not full-chain attack detection."""
     if iterations < 0:
         raise ValueError("iterations must be non-negative")
+
     samples = [
-        {"event_type": "Sender signature", "status": "FAIL", "details": "Signature verification failed"},
-        {"event_type": "Blockchain commitment", "status": "FAIL", "details": "SHA-256 mismatch"},
-        {"event_type": "IPFS retrieval", "status": "ERROR", "details": "IPFS unavailable"},
-        {"event_type": "Recipient binding", "status": "FAIL", "details": "different recipient key"},
+        {
+            "event_type": "Sender signature",
+            "status": "FAIL",
+            "details": "Signature verification failed",
+        },
+        {
+            "event_type": "Blockchain commitment",
+            "status": "FAIL",
+            "details": "SHA-256 mismatch",
+        },
+        {
+            "event_type": "IPFS retrieval",
+            "status": "ERROR",
+            "details": "IPFS unavailable",
+        },
+        {
+            "event_type": "Recipient binding",
+            "status": "FAIL",
+            "details": "different recipient key",
+        },
     ]
+
     start = time.perf_counter()
     detected = 0
+
     for index in range(iterations):
         sample = samples[index % len(samples)]
-        detected += bool(classify_event(sample["event_type"], sample["status"], sample["details"]))
+        detected += bool(
+            classify_event(
+                sample["event_type"],
+                sample["status"],
+                sample["details"],
+            )
+        )
+
     elapsed_ms = (time.perf_counter() - start) * 1000
+
     return {
         "iterations": iterations,
         "synthetic_signals_detected": detected,
         "synthetic_detection_rate": detected / iterations if iterations else 0,
         "total_policy_time_ms": elapsed_ms,
         "mean_policy_time_ms": elapsed_ms / iterations if iterations else 0,
-        "scope": "Synthetic policy-classification microbenchmark only; not measured end-to-end attack detection.",
+        "scope": (
+            "Synthetic policy-classification microbenchmark only; "
+            "not measured end-to-end attack detection."
+        ),
     }
