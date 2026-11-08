@@ -1,5 +1,5 @@
 """SQLite auth and approval helpers for the local capstone demo."""
-import hashlib, hmac, os, secrets, sqlite3
+import hashlib, hmac, json, os, secrets, sqlite3
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +25,61 @@ def initialize():
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (cid, recipient_username)
         )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS trusted_sender_keys (
+            username TEXT PRIMARY KEY COLLATE NOCASE,
+            public_key_pem TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            registered_by TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
+        )""")
+        con.execute("""CREATE TABLE IF NOT EXISTS schema_migrations (
+            name TEXT PRIMARY KEY,
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )""")
+        _migrate_legacy_trust_store(con)
+
+
+def _migrate_legacy_trust_store(con):
+    """Import previously trusted JSON entries once, preserving existing trust."""
+    migration = "legacy_json_trusted_sender_keys_v1"
+    if con.execute("SELECT 1 FROM schema_migrations WHERE name=?", (migration,)).fetchone():
+        return
+    legacy_path = Path(__file__).resolve().parent / "keys" / "trusted_sender_signing_keys.json"
+    if os.environ.get("CAPSTONE_TRUST_STORE"):
+        legacy_path = Path(os.environ["CAPSTONE_TRUST_STORE"])
+    imported = 0
+    if legacy_path.is_file():
+        try:
+            entries = json.loads(legacy_path.read_text(encoding="utf-8"))
+            if isinstance(entries, dict):
+                for username, entry in entries.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    pem, fp = entry.get("public_key_pem"), entry.get("fingerprint")
+                    if not isinstance(username, str) or not isinstance(pem, str) or not isinstance(fp, str):
+                        continue
+                    actual = hashlib.sha256(pem.strip().encode("utf-8")).hexdigest()
+                    if not hmac.compare_digest(actual, fp):
+                        continue
+                    user = con.execute(
+                        "SELECT role,status FROM users WHERE username=?", (username,)
+                    ).fetchone()
+                    if not user or user["role"] != "sender" or user["status"] != "approved":
+                        continue
+                    con.execute(
+                        """INSERT OR IGNORE INTO trusted_sender_keys
+                           (username,public_key_pem,fingerprint,registered_by)
+                           VALUES(?,?,?,?)""",
+                        (username, pem, fp, "legacy-migration"),
+                    )
+                    imported += max(con.execute("SELECT changes()").fetchone()[0], 0)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+    _event(con, None, "trusted_sender_keys_migrated",
+           f"Imported {imported} legacy trusted sender key(s).")
+    con.execute("INSERT INTO schema_migrations(name) VALUES(?)", (migration,))
 
 def _hash(password, salt):
     return hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), ITERATIONS).hex()
@@ -90,8 +145,18 @@ def review_user(username, status, admin_username):
         row=con.execute('SELECT role,status FROM users WHERE username=?',(username,)).fetchone()
         if not row or row['role']=='admin':
             raise ValueError('Client not found or cannot modify administrator account.')
-        con.execute('UPDATE users SET status=?, reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP WHERE username=?',(status,admin_username,username))
+        con.execute(
+            'UPDATE users SET status=?, reviewed_by=?, reviewed_at=CURRENT_TIMESTAMP WHERE username=?',
+            (status,admin_username,username)
+        )
         _event(con, username, f'account_{status}', f'Reviewed by {admin_username}')
+        if status == "revoked" and row["role"] == "sender":
+            key=con.execute("SELECT fingerprint FROM trusted_sender_keys WHERE username=?",(username,)).fetchone()
+            if key:
+                con.execute("DELETE FROM trusted_sender_keys WHERE username=?",(username,))
+                _event(con, admin_username, "trusted_sender_key_revoked",
+                       f"sender={username}; fingerprint={key['fingerprint']}; reason=sender_account_revoked")
+
 
 def list_events(limit=300):
     initialize()
@@ -173,3 +238,66 @@ def can_access_package(cid, recipient_username):
             (cid, recipient_username),
         ).fetchone()
         return row is not None
+
+def register_trusted_sender_key(username, public_key_pem, fingerprint, admin_username):
+    """Atomically register/replace an approved sender key and write its audit event."""
+    initialize()
+    username=username.strip()
+    pem=public_key_pem.decode("utf-8") if isinstance(public_key_pem,bytes) else str(public_key_pem)
+    actual_fingerprint = hashlib.sha256(pem.strip().encode("utf-8")).hexdigest()
+    if not hmac.compare_digest(actual_fingerprint, str(fingerprint)):
+        raise ValueError("Public-key fingerprint does not match the supplied PEM.")
+    with _connect() as con:
+        user=con.execute("SELECT role,status FROM users WHERE username=?",(username,)).fetchone()
+        if not user or user["role"]!="sender" or user["status"]!="approved":
+            raise ValueError("Only approved sender accounts can have trusted signing keys.")
+        existing=con.execute("SELECT fingerprint FROM trusted_sender_keys WHERE username=?",(username,)).fetchone()
+        con.execute("""INSERT INTO trusted_sender_keys
+            (username,public_key_pem,fingerprint,registered_by,created_at,updated_at)
+            VALUES(?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)
+            ON CONFLICT(username) DO UPDATE SET public_key_pem=excluded.public_key_pem,
+            fingerprint=excluded.fingerprint,registered_by=excluded.registered_by,
+            updated_at=CURRENT_TIMESTAMP""",(username,pem,fingerprint,admin_username))
+        action="trusted_sender_key_replaced" if existing else "trusted_sender_key_registered"
+        _event(con,admin_username,action,f"sender={username}; fingerprint={fingerprint}")
+    return {"username":username,"fingerprint":fingerprint,"action":action}
+
+
+def list_trusted_sender_keys():
+    initialize()
+    with _connect() as con:
+        rows=con.execute("""SELECT k.username,k.fingerprint,k.registered_by,k.created_at,k.updated_at
+            FROM trusted_sender_keys k JOIN users u ON u.username=k.username
+            WHERE u.role='sender' AND u.status='approved'
+            ORDER BY k.username COLLATE NOCASE""").fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_trusted_sender_key(username):
+    initialize()
+    with _connect() as con:
+        row=con.execute("""SELECT k.public_key_pem,k.fingerprint FROM trusted_sender_keys k
+            JOIN users u ON u.username=k.username
+            WHERE k.username=? AND u.role='sender' AND u.status='approved'""",(username,)).fetchone()
+        return dict(row) if row else None
+
+
+def revoke_trusted_sender_key(username, admin_username):
+    initialize()
+    with _connect() as con:
+        row=con.execute("SELECT fingerprint FROM trusted_sender_keys WHERE username=?",(username,)).fetchone()
+        if not row:
+            return False
+        con.execute("DELETE FROM trusted_sender_keys WHERE username=?",(username,))
+        _event(con,admin_username,"trusted_sender_key_revoked",
+               f"sender={username}; fingerprint={row['fingerprint']}")
+        return True
+
+
+def is_trusted_sender_key(username, public_key_fingerprint):
+    initialize()
+    with _connect() as con:
+        row=con.execute("""SELECT k.fingerprint FROM trusted_sender_keys k
+            JOIN users u ON u.username=k.username
+            WHERE k.username=? AND u.role='sender' AND u.status='approved'""",(username,)).fetchone()
+        return bool(row and hmac.compare_digest(row["fingerprint"],public_key_fingerprint))

@@ -1,83 +1,83 @@
-"""Explicit local trust store for sender signing public keys.
+"""Central trusted-sender registry backed by the authentication SQLite database.
 
-Trust-on-first-use is deliberately NOT performed here. An administrator must
-provision a sender's public key through a trusted channel. The file is local
-runtime state and must not be committed to Git.
+The legacy JSON path is retained only for one-time migration and explicit
+backward-compatible test calls. Production verification uses SQLite.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 
-TRUST_STORE = Path(
-    os.environ.get(
-        "CAPSTONE_TRUST_STORE",
-        str(Path(__file__).resolve().parent / "keys" / "trusted_sender_signing_keys.json"),
-    )
-)
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+
+try:
+    from . import auth_manager
+except ImportError:
+    import auth_manager
+
+TRUST_STORE = Path(os.environ.get(
+    "CAPSTONE_TRUST_STORE",
+    str(Path(__file__).resolve().parent / "keys" / "trusted_sender_signing_keys.json"),
+))
 
 
 def fingerprint(public_key_pem: bytes | str) -> str:
-    if isinstance(public_key_pem, str):
-        public_key_pem = public_key_pem.encode("utf-8")
-    # Canonical fingerprint of the PEM bytes as provisioned.
-    return hashlib.sha256(public_key_pem.strip()).hexdigest()
+    raw = public_key_pem.encode("utf-8") if isinstance(public_key_pem, str) else public_key_pem
+    return hashlib.sha256(raw.strip()).hexdigest()
 
 
-def load_trusted_keys(path: Path = TRUST_STORE) -> dict[str, dict[str, str]]:
-    if not path.exists():
-        return {}
-    data = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("Trusted-key store must be a JSON object.")
-    return data
+def validate_signing_public_key(public_key_pem: bytes | str) -> tuple[str, str]:
+    raw = public_key_pem.encode("utf-8") if isinstance(public_key_pem, str) else public_key_pem
+    try:
+        key = serialization.load_pem_public_key(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError("The uploaded file is not a valid PEM public key.") from exc
+    if not isinstance(key, ec.EllipticCurvePublicKey):
+        raise ValueError("The sender signing key must be an elliptic-curve public key.")
+    if key.curve.name != "secp256k1":
+        raise ValueError(f"Expected a SECP256K1 signing key; received {key.curve.name}.")
+    return raw.decode("utf-8"), fingerprint(raw)
 
 
-def is_trusted(username: str, public_key_pem: bytes | str, path: Path = TRUST_STORE) -> bool:
-    entries = load_trusted_keys(path)
-    entry = entries.get(username)
-    if not isinstance(entry, dict) or not isinstance(entry.get("fingerprint"), str):
-        return False
-    return fingerprint(public_key_pem) == entry["fingerprint"]
+def load_trusted_keys(path: Path | None = None) -> dict[str, dict[str, str]]:
+    """Return registry entries; default source is the central SQLite database."""
+    if path is not None:
+        if not path.exists():
+            return {}
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Trusted-key store must be a JSON object.")
+        return data
+    auth_manager.initialize()
+    with auth_manager._connect() as con:
+        rows = con.execute(
+            "SELECT username,public_key_pem,fingerprint FROM trusted_sender_keys"
+        ).fetchall()
+    return {r["username"]: {"public_key_pem": r["public_key_pem"],
+                            "fingerprint": r["fingerprint"]} for r in rows}
 
 
-def provision_trusted_key(
-    username: str,
-    public_key_pem: bytes | str,
-    *,
-    administrator_confirmed: bool,
-    path: Path = TRUST_STORE,
-) -> str:
-    """Provision a key only after an administrator independently verifies it.
+def is_trusted(username: str, public_key_pem: bytes | str, path: Path | None = None) -> bool:
+    fp = fingerprint(public_key_pem)
+    if path is not None:
+        entry = load_trusted_keys(path).get(username)
+        return bool(isinstance(entry, dict) and isinstance(entry.get("fingerprint"), str)
+                    and hmac.compare_digest(fp, entry["fingerprint"]))
+    return auth_manager.is_trusted_sender_key(username, fp)
 
-    This helper intentionally requires an explicit confirmation flag. It does
-    not establish the identity of the person supplying the key by itself.
-    """
+
+def provision_trusted_key(username: str, public_key_pem: bytes | str, *,
+                          administrator_confirmed: bool, admin_username: str = "legacy-admin",
+                          path: Path | None = None) -> str:
+    """Compatibility helper; production callers should use the authenticated Admin API."""
     if not administrator_confirmed:
-        raise PermissionError(
-            "A trusted administrator must verify the sender public key out-of-band."
-        )
-    if not username or not username.strip():
-        raise ValueError("username is required")
-    if isinstance(public_key_pem, bytes):
-        pem_text = public_key_pem.decode("utf-8")
-    else:
-        pem_text = public_key_pem
-    fp = fingerprint(pem_text)
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    current = load_trusted_keys(path)
-    current[username] = {"fingerprint": fp, "public_key_pem": pem_text}
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(current, indent=2, sort_keys=True), encoding="utf-8")
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        raise PermissionError("A trusted administrator must verify the sender public key out-of-band.")
+    if path is not None:
+        raise ValueError("Direct JSON trust-store writes are disabled; use the Admin API.")
+    pem, fp = validate_signing_public_key(public_key_pem)
+    auth_manager.register_trusted_sender_key(username, pem, fp, admin_username)
     return fp

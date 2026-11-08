@@ -78,5 +78,6 @@ def verify_sender_signature(
         return vk.verify(
             signature, canonical_package_fields(package), hashfunc=hashlib.sha256
         )
-    except (KeyError, ValueError, TypeError, ecdsa.BadSignatureError):
+    except Exception:
+        # Includes registry/database failures: verification must fail closed.
         return False

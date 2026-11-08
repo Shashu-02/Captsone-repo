@@ -118,6 +118,11 @@ class EventRequest(BaseModel):
     details: str = Field(default="", max_length=500)
 
 
+class TrustedKeyRegistration(BaseModel):
+    public_key_pem: str = Field(min_length=1, max_length=16000)
+    administrator_confirmed: bool
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "secure-storage-admin-api"}
@@ -225,6 +230,42 @@ def admin_events(
     admin: dict[str, Any] = Depends(_require_admin),
 ) -> list[dict[str, Any]]:
     return auth_manager.list_events()
+
+
+@app.get("/api/admin/trusted-keys")
+def admin_trusted_keys(
+    admin: dict[str, Any] = Depends(_require_admin),
+) -> list[dict[str, Any]]:
+    return auth_manager.list_trusted_sender_keys()
+
+
+@app.post("/api/admin/trusted-keys/{username}")
+def register_admin_trusted_key(
+    username: str,
+    data: TrustedKeyRegistration,
+    admin: dict[str, Any] = Depends(_require_admin),
+) -> dict[str, Any]:
+    if not data.administrator_confirmed:
+        raise HTTPException(status_code=400, detail="Independent fingerprint confirmation is required.")
+    try:
+        from .trusted_keys import validate_signing_public_key
+        pem, fp = validate_signing_public_key(data.public_key_pem)
+        return auth_manager.register_trusted_sender_key(
+            username, pem, fp, admin["username"]
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.delete("/api/admin/trusted-keys/{username}")
+def revoke_admin_trusted_key(
+    username: str,
+    admin: dict[str, Any] = Depends(_require_admin),
+) -> dict[str, Any]:
+    revoked = auth_manager.revoke_trusted_sender_key(username, admin["username"])
+    if not revoked:
+        raise HTTPException(status_code=404, detail="No trusted key exists for this sender.")
+    return {"username": username, "status": "revoked"}
 
 
 # ==========================================

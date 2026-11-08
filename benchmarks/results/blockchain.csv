@@ -1,0 +1,2 @@
+network,contract,repeats,write_mean_ms,write_median_ms,read_mean_ms,read_median_ms,gas_mean,gas_min,gas_max,transaction_cost_mean_wei,readback_check
+Hardhat local chain 31337,0x5FbDB2315678afecb367f032d93F642f64180aa3,10,21.679979200052912,21.576378499048587,6.01059839973459,5.437908500425692,235094.8,234538,235495,272114653383975.4,PASS

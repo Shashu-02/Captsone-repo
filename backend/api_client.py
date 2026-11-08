@@ -2,6 +2,7 @@
 
 import base64
 import os
+from urllib.parse import quote
 
 import requests
 
@@ -191,3 +192,23 @@ def verify_blockchain_record(token, cid):
         token=token,
         json={"cid": cid},
     )
+
+
+def admin_trusted_keys(token):
+    return request("GET", "/api/admin/trusted-keys", token=token)
+
+
+def register_trusted_key(token, username, public_key_pem, administrator_confirmed):
+    return request(
+        "POST",
+        f"/api/admin/trusted-keys/{quote(username, safe='')}",
+        token=token,
+        json={
+            "public_key_pem": public_key_pem,
+            "administrator_confirmed": bool(administrator_confirmed),
+        },
+    )
+
+
+def revoke_trusted_key(token, username):
+    return request("DELETE", f"/api/admin/trusted-keys/{quote(username, safe='')}", token=token)
